@@ -19,8 +19,9 @@ from apex.parallel import DistributedDataParallel as DDP
 
 from models.modeling import VisionTransformer, CONFIGS
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
-from utils.data_utils import get_loader
+from utils.data_utils import get_loader, get_loader_split
 from utils.dist_util import get_world_size
+from data.data_loader import load_split_cifar100
 
 
 logger = logging.getLogger(__name__)
@@ -59,7 +60,8 @@ def setup(args):
     # Prepare model
     config = CONFIGS[args.model_type]
 
-    num_classes = 10 if args.dataset == "cifar10" else 100
+    # num_classes = 10 if args.dataset == "cifar10" else 100
+    num_classes = 10
 
     model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes)
     model.load_from(np.load(args.pretrained_dir))
@@ -147,96 +149,104 @@ def train(args, model):
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
     # Prepare dataset
-    train_loader, test_loader = get_loader(args)
+    # train_loader, test_loader = get_loader(args)
+    train_loader_list, test_loader_list, classes_list  = get_loader_split(args, split_num = 10)
+    # train_loader_list, test_loader_list, classes_list = load_split_cifar100(args, split_num = 10)
 
-    # Prepare optimizer and scheduler
-    optimizer = torch.optim.SGD(model.parameters(),
-                                lr=args.learning_rate,
-                                momentum=0.9,
-                                weight_decay=args.weight_decay)
-    t_total = args.num_steps
-    if args.decay_type == "cosine":
-        scheduler = WarmupCosineSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
-    else:
-        scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
+    TASK_NUM = 10
+    for task in range(TASK_NUM):
+        train_loader = train_loader_list[task]
+        test_loader = test_loader_list[task]
 
-    if args.fp16:
-        model, optimizer = amp.initialize(models=model,
-                                          optimizers=optimizer,
-                                          opt_level=args.fp16_opt_level)
-        amp._amp_state.loss_scalers[0]._loss_scale = 2**20
+        # Prepare optimizer and scheduler
+        optimizer = torch.optim.SGD(model.parameters(),
+                                    lr=args.learning_rate,
+                                    momentum=0.9,
+                                    weight_decay=args.weight_decay)
+        t_total = args.num_steps
+        if args.decay_type == "cosine":
+            scheduler = WarmupCosineSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
+        else:
+            scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
 
-    # Distributed training
-    if args.local_rank != -1:
-        model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
+        if args.fp16:
+            model, optimizer = amp.initialize(models=model,
+                                            optimizers=optimizer,
+                                            opt_level=args.fp16_opt_level)
+            amp._amp_state.loss_scalers[0]._loss_scale = 2**20
 
-    # Train!
-    logger.info("***** Running training *****")
-    logger.info("  Total optimization steps = %d", args.num_steps)
-    logger.info("  Instantaneous batch size per GPU = %d", args.train_batch_size)
-    logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
-                args.train_batch_size * args.gradient_accumulation_steps * (
-                    torch.distributed.get_world_size() if args.local_rank != -1 else 1))
-    logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
+        # Distributed training
+        if args.local_rank != -1:
+            model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
 
-    model.zero_grad()
-    set_seed(args)  # Added here for reproducibility (even between python 2 and 3)
-    losses = AverageMeter()
-    global_step, best_acc = 0, 0
-    while True:
-        model.train()
-        epoch_iterator = tqdm(train_loader,
-                              desc="Training (X / X Steps) (loss=X.X)",
-                              bar_format="{l_bar}{r_bar}",
-                              dynamic_ncols=True,
-                              disable=args.local_rank not in [-1, 0])
-        for step, batch in enumerate(epoch_iterator):
-            batch = tuple(t.to(args.device) for t in batch)
-            x, y = batch
-            loss = model(x, y)
+        # Train!
+        logger.info("***** Running training *****")
+        logger.info("  Total optimization steps = %d", args.num_steps)
+        logger.info("  Instantaneous batch size per GPU = %d", args.train_batch_size)
+        logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
+                    args.train_batch_size * args.gradient_accumulation_steps * (
+                        torch.distributed.get_world_size() if args.local_rank != -1 else 1))
+        logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
 
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
-            if args.fp16:
-                with amp.scale_loss(loss, optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
+        model.zero_grad()
+        set_seed(args)  # Added here for reproducibility (even between python 2 and 3)
+        losses = AverageMeter()
+        global_step, best_acc = 0, 0
+        while True:
+            model.train()
+            epoch_iterator = tqdm(train_loader,
+                                desc="Training (X / X Steps) (loss=X.X)",
+                                bar_format="{l_bar}{r_bar}",
+                                dynamic_ncols=True,
+                                disable=args.local_rank not in [-1, 0])
+            for step, batch in enumerate(epoch_iterator):
+                batch = tuple(t.to(args.device) for t in batch)
+                x, y = batch
+                loss = model(x, y)
 
-            if (step + 1) % args.gradient_accumulation_steps == 0:
-                losses.update(loss.item()*args.gradient_accumulation_steps)
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
                 if args.fp16:
-                    torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+                    with amp.scale_loss(loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                scheduler.step()
-                optimizer.step()
-                optimizer.zero_grad()
-                global_step += 1
+                    loss.backward()
 
-                epoch_iterator.set_description(
-                    "Training (%d / %d Steps) (loss=%2.5f)" % (global_step, t_total, losses.val)
-                )
-                if args.local_rank in [-1, 0]:
-                    writer.add_scalar("train/loss", scalar_value=losses.val, global_step=global_step)
-                    writer.add_scalar("train/lr", scalar_value=scheduler.get_lr()[0], global_step=global_step)
-                if global_step % args.eval_every == 0 and args.local_rank in [-1, 0]:
-                    accuracy = valid(args, model, writer, test_loader, global_step)
-                    if best_acc < accuracy:
-                        save_model(args, model)
-                        best_acc = accuracy
-                    model.train()
+                if (step + 1) % args.gradient_accumulation_steps == 0:
+                    losses.update(loss.item()*args.gradient_accumulation_steps)
+                    if args.fp16:
+                        torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
+                    else:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    scheduler.step()
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    global_step += 1
 
-                if global_step % t_total == 0:
-                    break
-        losses.reset()
-        if global_step % t_total == 0:
-            break
+                    epoch_iterator.set_description(
+                        "Training%d (%d / %d Steps) (loss=%2.5f)" % (task, global_step, t_total, losses.val)
+                    )
+                    if args.local_rank in [-1, 0]:
+                        writer.add_scalar("train/loss{}".format(task), scalar_value=losses.val, global_step=global_step)
+                        writer.add_scalar("train/lr{}".format(task), scalar_value=scheduler.get_lr()[0], global_step=global_step)
+                    if global_step % args.eval_every == 0 and args.local_rank in [-1, 0]:
+                        accuracy = valid(args, model, writer, test_loader, global_step)
+                        if best_acc < accuracy:
+                            save_model(args, model)
+                            best_acc = accuracy
+                        model.train()
+
+                    if global_step % t_total == 0:
+                        break
+            losses.reset()
+            if global_step % t_total == 0:
+                break
+
+        logger.info("Best Accuracy: \t%f" % best_acc)
+        logger.info("End Training!")
 
     if args.local_rank in [-1, 0]:
         writer.close()
-    logger.info("Best Accuracy: \t%f" % best_acc)
-    logger.info("End Training!")
 
 
 def main():
