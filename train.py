@@ -1,6 +1,7 @@
 # coding=utf-8
 from __future__ import absolute_import, division, print_function
 
+import sys
 import logging
 import argparse
 import os
@@ -17,7 +18,8 @@ from torch.utils.tensorboard import SummaryWriter
 from apex import amp
 from apex.parallel import DistributedDataParallel as DDP
 
-from models.modeling import VisionTransformer, CONFIGS
+# from models.modeling import VisionTransformer, CONFIGS
+from models.modeling_RKR import VisionTransformer, CONFIGS
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
 from utils.data_utils import get_loader, get_loader_split
 from utils.dist_util import get_world_size
@@ -49,9 +51,12 @@ def simple_accuracy(preds, labels):
     return (preds == labels).mean()
 
 
-def save_model(args, model):
+def save_model(args, model, task):
+    save_folder = os.path.join(args.output_dir, args.name)
+    if not os.path.exists(save_folder):
+        os.makedirs(save_folder)
     model_to_save = model.module if hasattr(model, 'module') else model
-    model_checkpoint = os.path.join(args.output_dir, "%s_checkpoint.bin" % args.name)
+    model_checkpoint = os.path.join(save_folder, "%s_task%d.bin" % (args.name, task))
     torch.save(model_to_save.state_dict(), model_checkpoint)
     logger.info("Saved model checkpoint to [DIR: %s]", args.output_dir)
 
@@ -62,8 +67,14 @@ def setup(args):
 
     # num_classes = 10 if args.dataset == "cifar10" else 100
     num_classes = 10
+    num_tasks = 10
 
-    model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes)
+    model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes, num_tasks=num_tasks)
+    print(model)
+    # print(list(np.load(args.pretrained_dir)))
+    # for name, param in model.named_parameters():
+    #     print(name)
+    # sys.exit()
     model.load_from(np.load(args.pretrained_dir))
     model.to(args.device)
     num_params = count_parameters(model)
@@ -88,13 +99,11 @@ def set_seed(args):
         torch.cuda.manual_seed_all(args.seed)
 
 
-def valid(args, model, writer, test_loader, global_step):
+def valid(args, model, writer, test_loader, global_step, task):
     # Validation!
     eval_losses = AverageMeter()
 
     logger.info("\n***** Running Validation *****")
-    logger.info("  Num steps = %d", len(test_loader))
-    logger.info("  Batch size = %d", args.eval_batch_size)
 
     model.eval()
     all_preds, all_label = [], []
@@ -108,7 +117,7 @@ def valid(args, model, writer, test_loader, global_step):
         batch = tuple(t.to(args.device) for t in batch)
         x, y = batch
         with torch.no_grad():
-            logits = model(x)[0]
+            logits = model(x, task=task)[0]
 
             eval_loss = loss_fct(logits, y)
             eval_losses.update(eval_loss.item())
@@ -130,8 +139,8 @@ def valid(args, model, writer, test_loader, global_step):
     all_preds, all_label = all_preds[0], all_label[0]
     accuracy = simple_accuracy(all_preds, all_label)
 
-    logger.info("\n")
-    logger.info("Validation Results")
+    print("\n")
+    logger.info("Task%d Validation Results" % task)
     logger.info("Global Steps: %d" % global_step)
     logger.info("Valid Loss: %2.5f" % eval_losses.avg)
     logger.info("Valid Accuracy: %2.5f" % accuracy)
@@ -179,14 +188,32 @@ def train(args, model):
         if args.local_rank != -1:
             model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
 
+        for name, param in model.named_parameters():
+            if task == 0:
+                if 'head' in name:
+                    if name.split('.')[-2] != str(task):
+                        param.requires_grad = False
+                if 'sfg' in name or 'rg' in name:
+                    param.requires_grad = False
+            else:
+                param.requires_grad = False
+                if 'head' in name:
+                    if name.split('.')[-2] == str(task):
+                        param.requires_grad = True
+                if 'sfg' in name or 'rg' in name:
+                    if name.split('.')[-1] == str(task):
+                        param.requires_grad = True
         # Train!
-        logger.info("***** Running training *****")
+        logger.info("\n***** Running training *****")
         logger.info("  Total optimization steps = %d", args.num_steps)
         logger.info("  Instantaneous batch size per GPU = %d", args.train_batch_size)
         logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
                     args.train_batch_size * args.gradient_accumulation_steps * (
                         torch.distributed.get_world_size() if args.local_rank != -1 else 1))
         logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
+
+        logger.info("  Eval steps = %d", len(test_loader))
+        logger.info("  Eval Batch size = %d", args.eval_batch_size)
 
         model.zero_grad()
         set_seed(args)  # Added here for reproducibility (even between python 2 and 3)
@@ -202,7 +229,7 @@ def train(args, model):
             for step, batch in enumerate(epoch_iterator):
                 batch = tuple(t.to(args.device) for t in batch)
                 x, y = batch
-                loss = model(x, y)
+                loss = model(x, y, task)
 
                 if args.gradient_accumulation_steps > 1:
                     loss = loss / args.gradient_accumulation_steps
@@ -230,9 +257,9 @@ def train(args, model):
                         writer.add_scalar("train/loss{}".format(task), scalar_value=losses.val, global_step=global_step)
                         writer.add_scalar("train/lr{}".format(task), scalar_value=scheduler.get_lr()[0], global_step=global_step)
                     if global_step % args.eval_every == 0 and args.local_rank in [-1, 0]:
-                        accuracy = valid(args, model, writer, test_loader, global_step)
+                        accuracy = valid(args, model, writer, test_loader, global_step, task)
                         if best_acc < accuracy:
-                            save_model(args, model)
+                            save_model(args, model, task)
                             best_acc = accuracy
                         model.train()
 
@@ -242,7 +269,7 @@ def train(args, model):
             if global_step % t_total == 0:
                 break
 
-        logger.info("Best Accuracy: \t%f" % best_acc)
+        logger.info("Task%d Best Accuracy: \t%f" % (task, best_acc))
         logger.info("End Training!")
 
     if args.local_rank in [-1, 0]:
@@ -304,6 +331,15 @@ def main():
                              "0 (default value): dynamic loss scaling.\n"
                              "Positive power of 2: static loss scaling value.\n")
     args = parser.parse_args()
+
+    #handler2を作成
+    handler = logging.FileHandler(filename="./logs/{}.log".format(args.name))  #handler2はファイル出力
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)8s %(message)s"))
+
+    #loggerにハンドラを設定
+    logger.addHandler(handler)
+
 
     # Setup CUDA, GPU & distributed training
     if args.local_rank == -1:

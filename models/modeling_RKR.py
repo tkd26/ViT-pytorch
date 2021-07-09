@@ -34,33 +34,12 @@ FC_1 = "MlpBlock_3/Dense_1"
 ATTENTION_NORM = "LayerNorm_0"
 MLP_NORM = "LayerNorm_2"
 
-class RG_Conv(nn.Module):
-    def __init__(self, weight_shape, K: int, task_num: int):
-        super().__init__()
-        w, h, c_in, c_out = weight_shape
-
-        scale = 1e-5
-
-        self.LM_list = nn.ParameterList([nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(w * c_in, K)) * scale) for _ in range(task_num)])
-        self.RM_list = nn.ParameterList([nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(K, h * c_out)) * scale) for _ in range(task_num)])
-        # self.LM_list = nn.ParameterList([nn.Parameter(torch.zeros(w * c_in, K) + 1e-4) for _ in range(task_num)])
-        # self.RM_list = nn.ParameterList([nn.Parameter(torch.zeros(K, h * c_out) + 1e-4) for _ in range(task_num)])
-
-        self.LM_list[0] = nn.Parameter(torch.zeros(w * c_in, K))
-        self.RM_list[0] = nn.Parameter(torch.zeros(K, h * c_out))
-
-        # self.LM_list = nn.ParameterList([nn.Parameter(torch.zeros(w * c_in, K)) for _ in range(task_num)])
-        # self.RM_list = nn.ParameterList([nn.Parameter(torch.zeros(K, h * c_out)) for _ in range(task_num)])
-    
-    def forward(self, weight, task: int):
-        R = torch.mm(self.LM_list[task], self.RM_list[task])
-        R = R.view(weight.shape)
-        # print(R[0][0][0])
-        R = R + weight
-        return R
+K = 2
+TASK_NUM = 10
+RG, SFG = True, True
 
 class RG_FC(nn.Module):
-    def __init__(self, weight_shape, K: int, task_num: int):
+    def __init__(self, weight_shape, K: int = K, task_num: int = TASK_NUM):
         super().__init__()
         h_in, h_out = weight_shape
 
@@ -72,36 +51,21 @@ class RG_FC(nn.Module):
         self.LM_list[0] = nn.Parameter(torch.zeros(h_out, K))
         self.RM_list[0] = nn.Parameter(torch.zeros(K, h_in))
 
-        # self.LM_list = nn.ParameterList([nn.Parameter(torch.zeros(h_out, K)) for _ in range(task_num)])
-        # self.RM_list = nn.ParameterList([nn.Parameter(torch.zeros(K, h_in)) for _ in range(task_num)])
-
     def forward(self, weight, task: int):
         R = torch.mm(self.LM_list[task], self.RM_list[task])
         R = R.view(weight.shape)
         R = R + weight
         return R
 
-class SFG_Conv(nn.Module):
-    def __init__(self, c_out, task_num: int):
-        super().__init__()
-        self.F_list = nn.ParameterList([nn.Parameter(torch.ones(c_out)) for _ in range(task_num)])
-    
-    def forward(self, x, task):
-        F = self.F_list[task]
-        F = F.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-        F = F.repeat(x.shape[0], 1, x.shape[2], x.shape[3])
-        x *= F
-        return x
-
 class SFG_FC(nn.Module):
-    def __init__(self, c_out, task_num: int):
+    def __init__(self, c_out, task_num: int = TASK_NUM):
         super().__init__()
         self.F_list = nn.ParameterList([nn.Parameter(torch.ones(c_out)) for _ in range(task_num)])
     
     def forward(self, x, task: int):
         F = self.F_list[task]
-        F = F.unsqueeze(0)
-        F = F.repeat(x.shape[0], 1)
+        F = F.unsqueeze(0).unsqueeze(0)
+        F = F.repeat(x.shape[0], x.shape[1], 1)
         x *= F
         return x
         
@@ -138,15 +102,37 @@ class Attention(nn.Module):
 
         self.softmax = Softmax(dim=-1)
 
+        self.RG_query = RG_FC([config.hidden_size, self.all_head_size])
+        self.RG_key = RG_FC([config.hidden_size, self.all_head_size])
+        self.RG_value = RG_FC([config.hidden_size, self.all_head_size])
+        self.RG_out = RG_FC([config.hidden_size, config.hidden_size])
+
+        self.SFG_query = SFG_FC(self.all_head_size)
+        self.SFG_key = SFG_FC(self.all_head_size)
+        self.SFG_value = SFG_FC(self.all_head_size)
+        self.SFG_out = SFG_FC(self.all_head_size)
+
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3)
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, task):
+
+        if RG:
+            self.query.weight.data = self.RG_query(self.query.weight.data, task)
+            self.key.weight.data = self.RG_key(self.key.weight.data, task)
+            self.value.weight.data = self.RG_value(self.value.weight.data, task)
+            self.out.weight.data = self.RG_out(self.out.weight.data, task)
+
         mixed_query_layer = self.query(hidden_states)
         mixed_key_layer = self.key(hidden_states)
         mixed_value_layer = self.value(hidden_states)
+
+        if SFG:
+            mixed_query_layer = self.SFG_query(mixed_query_layer, task)
+            mixed_key_layer = self.SFG_key(mixed_key_layer, task)
+            mixed_value_layer = self.SFG_value(mixed_value_layer, task)
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
         key_layer = self.transpose_for_scores(mixed_key_layer)
@@ -163,6 +149,8 @@ class Attention(nn.Module):
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(*new_context_layer_shape)
         attention_output = self.out(context_layer)
+        if SFG:
+            attention_output = self.SFG_out(attention_output, task)
         attention_output = self.proj_dropout(attention_output)
         return attention_output, weights
 
@@ -177,17 +165,31 @@ class Mlp(nn.Module):
 
         self._init_weights()
 
+        self.RG1 = RG_FC([config.hidden_size, config.transformer["mlp_dim"]])
+        self.RG2 = RG_FC([config.transformer["mlp_dim"], config.hidden_size])
+
+        self.SFG1 = SFG_FC(config.transformer["mlp_dim"])
+        self.SFG2 = SFG_FC(config.hidden_size)
+
     def _init_weights(self):
         nn.init.xavier_uniform_(self.fc1.weight)
         nn.init.xavier_uniform_(self.fc2.weight)
         nn.init.normal_(self.fc1.bias, std=1e-6)
         nn.init.normal_(self.fc2.bias, std=1e-6)
 
-    def forward(self, x):
+    def forward(self, x, task):
+        if RG:
+            self.fc1.weight.data = self.RG1(self.fc1.weight.data, task)
+            self.fc2.weight.data = self.RG2(self.fc2.weight.data, task)
+
         x = self.fc1(x)
+        if SFG:
+            x = self.SFG1(x, task)
         x = self.act_fn(x)
         x = self.dropout(x)
         x = self.fc2(x)
+        if SFG:
+            x = self.SFG2(x, task)
         x = self.dropout(x)
         return x
 
@@ -248,15 +250,15 @@ class Block(nn.Module):
         self.ffn = Mlp(config)
         self.attn = Attention(config, vis)
 
-    def forward(self, x):
+    def forward(self, x, task):
         h = x
         x = self.attention_norm(x)
-        x, weights = self.attn(x)
+        x, weights = self.attn(x, task)
         x = x + h
 
         h = x
         x = self.ffn_norm(x)
-        x = self.ffn(x)
+        x = self.ffn(x, task)
         x = x + h
         return x, weights
 
@@ -308,10 +310,10 @@ class Encoder(nn.Module):
             layer = Block(config, vis)
             self.layer.append(copy.deepcopy(layer))
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, task):
         attn_weights = []
         for layer_block in self.layer:
-            hidden_states, weights = layer_block(hidden_states)
+            hidden_states, weights = layer_block(hidden_states, task)
             if self.vis:
                 attn_weights.append(weights)
         encoded = self.encoder_norm(hidden_states)
@@ -324,25 +326,26 @@ class Transformer(nn.Module):
         self.embeddings = Embeddings(config, img_size=img_size)
         self.encoder = Encoder(config, vis)
 
-    def forward(self, input_ids):
+    def forward(self, input_ids, task):
         embedding_output = self.embeddings(input_ids)
-        encoded, attn_weights = self.encoder(embedding_output)
+        encoded, attn_weights = self.encoder(embedding_output, task)
         return encoded, attn_weights
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False):
+    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False, num_tasks=10):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
+        self.num_tasks = num_tasks
         self.zero_head = zero_head
         self.classifier = config.classifier
 
         self.transformer = Transformer(config, img_size, vis)
-        self.head = Linear(config.hidden_size, num_classes)
+        self.head = nn.ModuleList([Linear(config.hidden_size, num_classes) for _ in range(self.num_tasks)])
 
-    def forward(self, x, labels=None):
-        x, attn_weights = self.transformer(x)
-        logits = self.head(x[:, 0])
+    def forward(self, x, labels=None, task=None):
+        x, attn_weights = self.transformer(x, task)
+        logits = self.head[task](x[:, 0])
 
         if labels is not None:
             loss_fct = CrossEntropyLoss()
@@ -354,8 +357,11 @@ class VisionTransformer(nn.Module):
     def load_from(self, weights):
         with torch.no_grad():
             if self.zero_head:
-                nn.init.zeros_(self.head.weight)
-                nn.init.zeros_(self.head.bias)
+                # nn.init.zeros_(self.head.weight)
+                # nn.init.zeros_(self.head.bias)
+                for i in range(self.num_tasks):
+                    nn.init.zeros_(self.head[i].weight)
+                    nn.init.zeros_(self.head[i].bias)
             else:
                 self.head.weight.copy_(np2th(weights["head/kernel"]).t())
                 self.head.bias.copy_(np2th(weights["head/bias"]).t())

@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, RandomSampler, DistributedSampler, Sequ
 logger = logging.getLogger(__name__)
 
 
+
 def get_loader(args):
     if args.local_rank not in [-1, 0]:
         torch.distributed.barrier()
@@ -136,8 +137,8 @@ def get_loader_split(args, split_num):
     test_sampler = SequentialSampler(testset)
 
     for i in range(split_num):
-        if i > 1:
-            continue
+        # if i > 1:
+        #     continue
         classes_list.append([classes[int(id)] for id in class_id_list[i]])
 
         trainset_list.append(Mydatasets(origin=trainset, transform=train_transforms, class_id=class_id_list[i]))
