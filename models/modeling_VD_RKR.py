@@ -344,13 +344,15 @@ class VisionTransformer(nn.Module):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
         self.num_tasks = num_tasks
+        self.tasks_class = [1000, 100, 100, 2, 47, 43, 1623, 10, 101, 102]
         self.zero_head = zero_head
         self.classifier = config.classifier
         self.multi_head = config.multi_head
 
         self.transformer = Transformer(config, img_size, vis)
         if self.multi_head:
-            self.head = nn.ModuleList([Linear(config.hidden_size, num_classes) for _ in range(self.num_tasks)])
+            # self.head = nn.ModuleList([Linear(config.hidden_size, num_classes) for _ in range(self.num_tasks)])
+            self.head = nn.ModuleList([Linear(config.hidden_size, num_classes) for _ in self.tasks_class])
         else:
             self.head = Linear(config.hidden_size, num_classes)
 

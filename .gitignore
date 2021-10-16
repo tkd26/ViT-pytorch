@@ -1,6 +1,7 @@
 /checkpoint
 /data
 /logs
+/logfile
 /output
 __pycache__
 command.md

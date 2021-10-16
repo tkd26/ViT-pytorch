@@ -20,10 +20,10 @@ from apex.parallel import DistributedDataParallel as DDP
 
 # from models.modeling import VisionTransformer, CONFIGS
 from models.modeling_RKR import VisionTransformer, CONFIGS
+from models.modeling_VD_RKR import VisionTransformer as VisionTransformer_VD
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
-from utils.data_utils import get_loader, get_loader_split
+from utils.data_utils import get_loader, get_loader_splitCifar100, get_loader_splitImagenet, get_VD_loader
 from utils.dist_util import get_world_size
-from data.data_loader import load_split_cifar100
 
 
 logger = logging.getLogger(__name__)
@@ -63,14 +63,17 @@ def save_model(args, model, task):
 
 def setup(args):
     # Prepare model
-    config = CONFIGS[args.model_type]
+    config = CONFIGS[args.model_type] # modeling_RKR.pyのCONFIGS
 
     # num_classes = 10 if args.dataset == "cifar10" else 100
-    num_classes = 10
+    num_classes = 10 if args.dataset == "cifar100" else 100
     num_tasks = 10
 
-    model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes, num_tasks=num_tasks)
-    print(model)
+    if args.dataset == 'VD':
+        model = VisionTransformer_VD(config, args.img_size, zero_head=True, num_classes=num_classes, num_tasks=num_tasks)
+    else:
+        model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes, num_tasks=num_tasks)
+    # print(model)
     # print(list(np.load(args.pretrained_dir)))
     # for name, param in model.named_parameters():
     #     print(name)
@@ -159,11 +162,16 @@ def train(args, model):
 
     # Prepare dataset
     # train_loader, test_loader = get_loader(args)
-    train_loader_list, test_loader_list, classes_list  = get_loader_split(args, split_num = 10)
-    # train_loader_list, test_loader_list, classes_list = load_split_cifar100(args, split_num = 10)
+    if args.dataset == 'cifar100':
+        train_loader_list, test_loader_list, classes_list  = get_loader_splitCifar100(args, split_num = 10)
+    elif args.dataset == 'imagenet':
+        train_loader_list, test_loader_list, classes_list  = get_loader_splitImagenet(args, split_num = 10)
+    elif args.dataset == 'VD':
+        train_loader_list, test_loader_list, classes_list  = get_VD_loader(args)
 
     TASK_NUM = 10
-    for task in range(TASK_NUM):
+    for task in range(args.start_task, TASK_NUM):
+
         train_loader = train_loader_list[task]
         test_loader = test_loader_list[task]
 
@@ -190,17 +198,26 @@ def train(args, model):
 
         for name, param in model.named_parameters():
             if task == 0:
+                # if 'head' in name:
+                #     if name.split('.')[-2] != str(task):
+                #         param.requires_grad = False
+                # if 'F_list' in name or 'RM_list' in name or 'LM_list' in name:
+                #     if name.split('.')[-1] != str(task):
+                #         param.requires_grad = False
+                
+                param.requires_grad = False
                 if 'head' in name:
-                    if name.split('.')[-2] != str(task):
-                        param.requires_grad = False
-                if 'sfg' in name or 'rg' in name:
-                    param.requires_grad = False
+                    if name.split('.')[-2] == str(task):
+                        param.requires_grad = True
+                if 'F_list' in name or 'RM_list' in name or 'LM_list' in name:
+                    if name.split('.')[-1] == str(task):
+                        param.requires_grad = True
             else:
                 param.requires_grad = False
                 if 'head' in name:
                     if name.split('.')[-2] == str(task):
                         param.requires_grad = True
-                if 'sfg' in name or 'rg' in name:
+                if 'F_list' in name or 'RM_list' in name or 'LM_list' in name:
                     if name.split('.')[-1] == str(task):
                         param.requires_grad = True
         # Train!
@@ -281,16 +298,17 @@ def main():
     # Required parameters
     parser.add_argument("--name", required=True,
                         help="Name of this run. Used for monitoring.")
-    parser.add_argument("--dataset", choices=["cifar10", "cifar100"], default="cifar10",
+    parser.add_argument("--dataset", choices=["cifar10", "cifar100", "imagenet", 'VD'], default="cifar10",
                         help="Which downstream task.")
-    parser.add_argument("--model_type", choices=["ViT-B_16", "ViT-B_32", "ViT-L_16",
-                                                 "ViT-L_32", "ViT-H_14", "R50-ViT-B_16"],
+    parser.add_argument("--model_type", choices=["ViT-B_16", "ViT-B_16_FC", "ViT-B_16_RKR", "ViT-B_16_RKRnoRG", "ViT-B_16_RKRnoSFG",
+                                                "ViT-B_32", "ViT-L_16", "ViT-L_32", "ViT-H_14", "R50-ViT-B_16"],
                         default="ViT-B_16",
                         help="Which variant to use.")
     parser.add_argument("--pretrained_dir", type=str, default="checkpoint/ViT-B_16.npz",
                         help="Where to search for pretrained ViT models.")
     parser.add_argument("--output_dir", default="output", type=str,
                         help="The output directory where checkpoints will be written.")
+    parser.add_argument("--start_task", default=0, type=int, help="")
 
     parser.add_argument("--img_size", default=224, type=int,
                         help="Resolution size")
@@ -315,6 +333,8 @@ def main():
     parser.add_argument("--max_grad_norm", default=1.0, type=float,
                         help="Max gradient norm.")
 
+    parser.add_argument('--gpu_id', type=str, default='0', help='gpu id: e.g. 0 1. use -1 for CPU')
+
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="local_rank for distributed training on gpus")
     parser.add_argument('--seed', type=int, default=42,
@@ -332,8 +352,10 @@ def main():
                              "Positive power of 2: static loss scaling value.\n")
     args = parser.parse_args()
 
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
+
     #handler2を作成
-    handler = logging.FileHandler(filename="./logs/{}.log".format(args.name))  #handler2はファイル出力
+    handler = logging.FileHandler(filename="./logfile/{}.log".format(args.name))  #handler2はファイル出力
     handler.setLevel(logging.INFO)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)8s %(message)s"))
 
