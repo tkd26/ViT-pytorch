@@ -20,7 +20,7 @@ from apex.parallel import DistributedDataParallel as DDP
 
 # from models.modeling import VisionTransformer, CONFIGS
 from models.modeling_RKR import VisionTransformer, CONFIGS
-from models.modeling_VD_RKR import VisionTransformer as VisionTransformer_VD
+from models.modeling_RKR3_2 import VisionTransformer as VisionTransformer_RKR3_2
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
 from utils.data_utils import get_loader, get_loader_splitCifar100, get_loader_splitImagenet, get_VD_loader
 from utils.dist_util import get_world_size
@@ -65,14 +65,22 @@ def setup(args):
     # Prepare model
     config = CONFIGS[args.model_type] # modeling_RKR.pyのCONFIGS
 
-    # num_classes = 10 if args.dataset == "cifar10" else 100
-    num_classes = 10 if args.dataset == "cifar100" else 100
-    num_tasks = 10
+    if args.lamb != None:
+        config.lamb = args.lamb
 
-    if args.dataset == 'VD':
-        model = VisionTransformer_VD(config, args.img_size, zero_head=True, num_classes=num_classes, num_tasks=num_tasks)
+    num_tasks = 10
+    if args.dataset == "cifar100":
+        num_classes = [10] * 10
+    elif args.dataset == "imagenet":
+        num_classes = [100] * 10
+    elif args.dataset == "VD":
+        num_classes = [1000, 100, 100, 2, 47, 43, 1623, 10, 101, 102]
+
+    if args.model_type == 'ViT-B_16_RKR3_2':
+        model = VisionTransformer_RKR3_2(config, args.img_size, zero_head=True, num_classes=num_classes)
     else:
-        model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes, num_tasks=num_tasks)
+        model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes)
+
     # print(model)
     # print(list(np.load(args.pretrained_dir)))
     # for name, param in model.named_parameters():
@@ -196,30 +204,33 @@ def train(args, model):
         if args.local_rank != -1:
             model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
 
+        
+        if 'RKR3' in args.model_type:
+            for name, param in model.named_parameters():
+                param.requires_grad = False
+                if 'F_list' in name or 'RM_list' in name or 'LM_list' in name:
+                    if name.split('.')[-1] == str(task):
+                        param.requires_grad = True
+                if 'head' in name:
+                    if name.split('.')[-2] == str(task):
+                        param.requires_grad = True
+                elif 'unc_filt' in name or 'weights_mat' in name:
+                    if name.split('.')[-1] == str(task):
+                        param.requires_grad = True
+        else:
+            for name, param in model.named_parameters():
+                param.requires_grad = False
+                if 'head' in name:
+                    if name.split('.')[-2] == str(task):
+                        param.requires_grad = True
+                if 'F_list' in name or 'RM_list' in name or 'LM_list' in name:
+                    if name.split('.')[-1] == str(task):
+                        param.requires_grad = True
+
         for name, param in model.named_parameters():
-            if task == 0:
-                # if 'head' in name:
-                #     if name.split('.')[-2] != str(task):
-                #         param.requires_grad = False
-                # if 'F_list' in name or 'RM_list' in name or 'LM_list' in name:
-                #     if name.split('.')[-1] != str(task):
-                #         param.requires_grad = False
-                
-                param.requires_grad = False
-                if 'head' in name:
-                    if name.split('.')[-2] == str(task):
-                        param.requires_grad = True
-                if 'F_list' in name or 'RM_list' in name or 'LM_list' in name:
-                    if name.split('.')[-1] == str(task):
-                        param.requires_grad = True
-            else:
-                param.requires_grad = False
-                if 'head' in name:
-                    if name.split('.')[-2] == str(task):
-                        param.requires_grad = True
-                if 'F_list' in name or 'RM_list' in name or 'LM_list' in name:
-                    if name.split('.')[-1] == str(task):
-                        param.requires_grad = True
+            if param.requires_grad == True:
+                print(name, end='')
+
         # Train!
         logger.info("\n***** Running training *****")
         logger.info("  Total optimization steps = %d", args.num_steps)
@@ -300,8 +311,11 @@ def main():
                         help="Name of this run. Used for monitoring.")
     parser.add_argument("--dataset", choices=["cifar10", "cifar100", "imagenet", 'VD'], default="cifar10",
                         help="Which downstream task.")
-    parser.add_argument("--model_type", choices=["ViT-B_16", "ViT-B_16_FC", "ViT-B_16_RKR", "ViT-B_16_RKRnoRG", "ViT-B_16_RKRnoSFG",
-                                                "ViT-B_32", "ViT-L_16", "ViT-L_32", "ViT-H_14", "R50-ViT-B_16"],
+    parser.add_argument("--model_type", choices=[
+        "ViT-B_16", "ViT-B_16_FC", 
+        "ViT-B_16_RKR", "ViT-B_16_RKRnoRG", "ViT-B_16_RKRnoSFG",
+        "ViT-B_16_RKR3_2",
+        "ViT-B_32", "ViT-L_16", "ViT-L_32", "ViT-H_14", "R50-ViT-B_16"],
                         default="ViT-B_16",
                         help="Which variant to use.")
     parser.add_argument("--pretrained_dir", type=str, default="checkpoint/ViT-B_16.npz",
@@ -333,11 +347,14 @@ def main():
     parser.add_argument("--max_grad_norm", default=1.0, type=float,
                         help="Max gradient norm.")
 
+    parser.add_argument("--lamb", default=None, type=float,
+                        help="use only RKR3_2")
+
     parser.add_argument('--gpu_id', type=str, default='0', help='gpu id: e.g. 0 1. use -1 for CPU')
 
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="local_rank for distributed training on gpus")
-    parser.add_argument('--seed', type=int, default=42,
+    parser.add_argument('--seed', type=int, default=100, # 42
                         help="random seed for initialization")
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
                         help="Number of updates steps to accumulate before performing a backward/update pass.")

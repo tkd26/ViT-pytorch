@@ -223,7 +223,7 @@ def data_transform(args, data_path, name, train=True):
     else:
         transform_train = transforms.Compose([
             transforms.Resize(args.img_size),
-            transforms.RandomCrop(args.img_size),
+            transforms.RandomCrop(64),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(means, stds),
@@ -238,7 +238,7 @@ def data_transform(args, data_path, name, train=True):
     else:
         transform_test = transforms.Compose([
             transforms.Resize(args.img_size),
-            transforms.CenterCrop(args.img_size),
+            transforms.CenterCrop(64),
             transforms.ToTensor(),
             transforms.Normalize(means, stds),
         ])

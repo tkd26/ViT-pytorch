@@ -12,6 +12,7 @@ from os.path import join as pjoin
 import torch
 import torch.nn as nn
 import numpy as np
+import math
 
 from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNorm
 from torch.nn.modules.utils import _pair
@@ -39,7 +40,7 @@ TASK_NUM = 10
 # RG, SFG = True, True
 
 class RG_FC(nn.Module):
-    def __init__(self, RG, K, task_num, h_in, h_out):
+    def __init__(self, RG, K, task_num, h_in, h_out, lamb):
         super().__init__()
 
         self.RG = RG
@@ -47,25 +48,106 @@ class RG_FC(nn.Module):
         self.h_out = h_out
 
         self.weight = nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(self.h_out, self.h_in)))
-
         self.bias = nn.Parameter(nn.init.normal_(torch.Tensor(self.h_out)))
 
+        '''
+        <Piggyback GANの手法>
+        Piggyback GANのunc_filtとweights_matをそれぞれRMとLMから生成する
+
+        出力フィルタ数 = h_out
+        非制約フィルタ数 = self.lambdas * h_out
+        piggybackフィルタ数 = 出力フィルタ数 - 非制約フィルタ数
+        フィルタバンクのフィルタ数 = 出力フィルタ数 + タスク番号 * 非制約フィルタ数
+
+        非制約フィルタ(非制約フィルタ数, h_in)
+        重み行列(フィルタバンクのフィルタ数, piggybackフィルタ数)
+        フィルタバンク(フィルタバンクのフィルタ数, h_in)
+
+        フィルタバンク x 重み行列(K, piggybackフィルタ数)
+        '''
+
         if self.RG:
+            self.out_filt = self.h_out # 出力フィルタ数
+
+            self.lambdas = lambdas = lamb # 非制約フィルタの割合
+            self.lamb_num = math.ceil(lambdas * self.out_filt) # 非制約フィルタ数
+            self.lamb_rem_num = self.out_filt - self.lamb_num # piggybackフィルタ数
+
+            # 非制約フィルタ(非制約フィルタ数, h_in)
             self.scale = 1e-1
-            self.LM_list = nn.ParameterList(
+            # 非制約フィルタのLM(h_in, K)
+            self.unc_filt_LM_list = nn.ParameterList(
                 [nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(self.h_in, K)) * self.scale) for _ in range(task_num)])
-            self.RM_list = nn.ParameterList(
-                [nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(K, self.h_out)) * self.scale) for _ in range(task_num)])
-            # self.M_list = nn.ParameterList([nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(self.h_out, self.h_in))* self.scale) for _ in range(task_num)])
+            # 非制約フィルタのRM(非制約フィルタ数, K)
+            self.unc_filt_RM_list = [nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(K, self.h_out)) * self.scale)]
+            self.unc_filt_RM_list += [nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(K, self.lamb_num)) * self.scale) for _ in range(task_num-1)]
+            self.unc_filt_RM_list = nn.ParameterList(self.unc_filt_RM_list)
+
+            # 重み行列((出力チャネル + タスク番号 * 非制約フィルタ数), piggybackフィルタ数)
+            # リストをtask0の値で初期化
+            self.weights_mat_LM_list = [None]
+            self.weights_mat_RM_list = [None]
+
+            for task in range(task_num - 1):
+                # 重み行列のLM((出力チャネル + タスク番号 * 非制約フィルタ数), K)
+                self.weights_mat_LM_list.append(
+                    nn.init.kaiming_uniform_(
+                        nn.Parameter(torch.Tensor((self.h_out + task * self.lamb_num), K))
+                    )
+                )
+                # 重み行列のRM(K, Piggybackフィルタ数)
+                self.weights_mat_RM_list.append(
+                    nn.init.kaiming_uniform_(
+                        nn.Parameter(torch.Tensor(K, self.lamb_rem_num))
+                    )
+                )
+
+            # ParameterListにしておく
+            self.unc_filt_LM_list =  nn.ParameterList(self.unc_filt_LM_list)
+            self.unc_filt_RM_list =  nn.ParameterList(self.unc_filt_RM_list)
+            self.weights_mat_LM_list = nn.ParameterList(self.weights_mat_LM_list)
+            self.weights_mat_RM_list = nn.ParameterList(self.weights_mat_RM_list)
+
+            # 過去タスクの非制約フィルタを保存するためのリスト
+            self.concat_unc_filter_list = [None] * task_num
 
     def forward(self, x, task: int):
         if self.RG:
-            R = torch.matmul(self.LM_list[task], self.RM_list[task])
-            R = R.permute(1, 0)
-            # R = self.M_list[task]
+            
+            if task == 0:
+                # RMとLMから非制約フィルタを生成（c_out, c_in）
+                self.unc_filt = torch.matmul(self.unc_filt_LM_list[task], self.unc_filt_RM_list[task]).view(self.h_out, self.h_in)
+                # 非制約フィルタをストアするリストに追加
+                self.concat_unc_filter_list[task] = self.unc_filt
+                
+                R = self.unc_filt
+            else:
+                # LMとRMから非制約フィルタを生成（非制約フィルタ数, 入力チャネル）
+                self.unc_filt = torch.matmul(self.unc_filt_LM_list[task], self.unc_filt_RM_list[task]).view(self.lamb_num, self.h_in)
+                # 非制約フィルタをストアするリストに追加
+                self.concat_unc_filter_list[task] = self.unc_filt
+                # LMとRMから重み行列を生成（フィルタバンクのフィルタ数, piggybackフィルタ数）
+                self.weights_mat = torch.matmul(self.weights_mat_LM_list[task], self.weights_mat_RM_list[task])
+
+                # フィルタバンクの設定
+                # 過去タスクの非制約フィルタをconcatする
+                self.concat_unc_filter = torch.cat(self.concat_unc_filter_list[:task], dim=0)
+                # フィルタバンクのリシェイプ（フィルタバンクのフィルタ数, 入力チャネル）→（入力チャネル, フィルタバンクのフィルタ数）
+                self.reshape_unc = torch.reshape(self.concat_unc_filter, (self.h_in, self.concat_unc_filter.shape[0]))
+                # フィルタバンクと重み行列の行列積（（入力チャネル * h * w）, piggybackフィルタ数）
+                self.reshape_unc_mul_w = torch.matmul(self.reshape_unc, self.weights_mat)
+                # piggybackフィルタのリシェイプ（入力チャネル, piggybackフィルタ数）→（piggybackフィルタ数, 入力チャネル）
+                self.pb_filt = torch.reshape(self.reshape_unc_mul_w, (self.reshape_unc_mul_w.shape[1], self.h_in))
+                # 非制約フィルタとpiggybackフィルタを結合（出力フィルタ数, 入力チャネル数）
+                self.final_weight_mat = torch.cat((self.unc_filt, self.pb_filt),dim=0)
+                self.final_weight_mat = self.final_weight_mat.cuda()
+                
+                R = self.final_weight_mat
+
             weight = R + self.weight
         else:
             weight = self.weight
+
         return nn.functional.linear(x, weight, bias=self.bias)
 
 class SFG_FC(nn.Module):
@@ -115,10 +197,10 @@ class Attention(nn.Module):
 
         self.RG, self.SFG = config.RG, config.SFG
 
-        self.query = RG_FC(self.RG, config.K, config.task_num, config.hidden_size, self.all_head_size)
-        self.key = RG_FC(self.RG, config.K, config.task_num, config.hidden_size, self.all_head_size)
-        self.value = RG_FC(self.RG, config.K, config.task_num, config.hidden_size, self.all_head_size)
-        self.out = RG_FC(self.RG, config.K, config.task_num, config.hidden_size, config.hidden_size)
+        self.query = RG_FC(self.RG, config.K, config.task_num, config.hidden_size, self.all_head_size, config.lamb)
+        self.key = RG_FC(self.RG, config.K, config.task_num, config.hidden_size, self.all_head_size, config.lamb)
+        self.value = RG_FC(self.RG, config.K, config.task_num, config.hidden_size, self.all_head_size, config.lamb)
+        self.out = RG_FC(self.RG, config.K, config.task_num, config.hidden_size, config.hidden_size, config.lamb)
 
         if self.SFG:
             self.SFG_query = SFG_FC(self.all_head_size, config.task_num)
@@ -173,8 +255,8 @@ class Mlp(nn.Module):
 
         self.RG, self.SFG = config.RG, config.SFG
 
-        self.fc1 = RG_FC(self.RG, config.K, config.task_num, config.hidden_size, config.transformer["mlp_dim"])
-        self.fc2 = RG_FC(self.RG, config.K, config.task_num, config.transformer["mlp_dim"], config.hidden_size)
+        self.fc1 = RG_FC(self.RG, config.K, config.task_num, config.hidden_size, config.transformer["mlp_dim"], config.lamb)
+        self.fc2 = RG_FC(self.RG, config.K, config.task_num, config.transformer["mlp_dim"], config.hidden_size, config.lamb)
 
         self._init_weights()
 
@@ -340,19 +422,17 @@ class Transformer(nn.Module):
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False, num_tasks=10):
+    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
-        self.num_tasks = num_tasks
-        self.tasks_class = [1000, 100, 100, 2, 47, 43, 1623, 10, 101, 102]
+        self.num_tasks = len(num_classes)
         self.zero_head = zero_head
         self.classifier = config.classifier
         self.multi_head = config.multi_head
 
         self.transformer = Transformer(config, img_size, vis)
         if self.multi_head:
-            # self.head = nn.ModuleList([Linear(config.hidden_size, num_classes) for _ in range(self.num_tasks)])
-            self.head = nn.ModuleList([Linear(config.hidden_size, num_classes) for _ in self.tasks_class])
+            self.head = nn.ModuleList([Linear(config.hidden_size, num_class) for num_class in num_classes])
         else:
             self.head = Linear(config.hidden_size, num_classes)
 
@@ -363,9 +443,14 @@ class VisionTransformer(nn.Module):
         else:
             logits = self.head(x[:, 0])
 
+        if type(self.num_classes) == list:
+            num_class = self.num_classes[task]
+        else:
+            num_class = self.num_classes
+
         if labels is not None:
             loss_fct = CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, self.num_classes), labels.view(-1))
+            loss = loss_fct(logits.view(-1, num_class), labels.view(-1))
             return loss
         else:
             return logits, attn_weights

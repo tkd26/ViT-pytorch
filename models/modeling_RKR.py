@@ -340,17 +340,17 @@ class Transformer(nn.Module):
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False, num_tasks=10):
+    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
-        self.num_tasks = num_tasks
+        self.num_tasks = len(num_classes)
         self.zero_head = zero_head
         self.classifier = config.classifier
         self.multi_head = config.multi_head
 
         self.transformer = Transformer(config, img_size, vis)
         if self.multi_head:
-            self.head = nn.ModuleList([Linear(config.hidden_size, num_classes) for _ in range(self.num_tasks)])
+            self.head = nn.ModuleList([Linear(config.hidden_size, num_class) for num_class in num_classes])
         else:
             self.head = Linear(config.hidden_size, num_classes)
 
@@ -361,9 +361,14 @@ class VisionTransformer(nn.Module):
         else:
             logits = self.head(x[:, 0])
 
+        if type(self.num_classes) == list:
+            num_class = self.num_classes[task]
+        else:
+            num_class = self.num_classes
+
         if labels is not None:
             loss_fct = CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, self.num_classes), labels.view(-1))
+            loss = loss_fct(logits.view(-1, num_class), labels.view(-1))
             return loss
         else:
             return logits, attn_weights
@@ -437,6 +442,7 @@ CONFIGS = {
     'ViT-B_16_RKR': configs.get_b16_RKR_config(),
     'ViT-B_16_RKRnoRG': configs.get_b16_RKRnoRG_config(),
     'ViT-B_16_RKRnoSFG': configs.get_b16_RKRnoSFG_config(),
+    'ViT-B_16_RKR3_2': configs.get_b16_RKR3_2_config(),
     'ViT-B_32': configs.get_b32_config(),
     'ViT-L_16': configs.get_l16_config(),
     'ViT-L_32': configs.get_l32_config(),
