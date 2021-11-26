@@ -22,7 +22,6 @@ import models.configs as configs
 
 from .modeling_resnet import ResNetV2
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -40,7 +39,7 @@ TASK_NUM = 10
 # RG, SFG = True, True
 
 class RG_FC(nn.Module):
-    def __init__(self, RG, K, task_num, h_in, h_out, lamb):
+    def __init__(self, RG, K, task_num, h_in, h_out, lambdas, scale):
         super().__init__()
 
         self.RG = RG
@@ -69,44 +68,46 @@ class RG_FC(nn.Module):
         if self.RG:
             self.out_filt = self.h_out # 出力フィルタ数
 
-            self.lambdas = lambdas = lamb # 非制約フィルタの割合
+            self.lambdas = lambdas # 非制約フィルタの割合
             self.lamb_num = math.ceil(lambdas * self.out_filt) # 非制約フィルタ数
             self.lamb_rem_num = self.out_filt - self.lamb_num # piggybackフィルタ数
 
             # 非制約フィルタ(非制約フィルタ数, h_in)
-            self.scale = 1e-1
+            self.scale = scale
             # 非制約フィルタのLM(h_in, K)
-            self.unc_filt_LM_list = nn.ParameterList(
-                [nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(self.h_in, K)) * self.scale) for _ in range(task_num)])
+            self.unc_filt_LM_list = [nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(self.h_in, K)) * self.scale) for _ in range(task_num)]
             # 非制約フィルタのRM(非制約フィルタ数, K)
             self.unc_filt_RM_list = [nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(K, self.h_out)) * self.scale)]
-            self.unc_filt_RM_list += [nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(K, self.lamb_num)) * self.scale) for _ in range(task_num-1)]
-            self.unc_filt_RM_list = nn.ParameterList(self.unc_filt_RM_list)
-
-            # 重み行列((出力チャネル + タスク番号 * 非制約フィルタ数), piggybackフィルタ数)
-            # リストをtask0の値で初期化
-            self.weights_mat_LM_list = [None]
-            self.weights_mat_RM_list = [None]
-
-            for task in range(task_num - 1):
-                # 重み行列のLM((出力チャネル + タスク番号 * 非制約フィルタ数), K)
-                self.weights_mat_LM_list.append(
-                    nn.init.kaiming_uniform_(
-                        nn.Parameter(torch.Tensor((self.h_out + task * self.lamb_num), K))
-                    )
-                )
-                # 重み行列のRM(K, Piggybackフィルタ数)
-                self.weights_mat_RM_list.append(
-                    nn.init.kaiming_uniform_(
-                        nn.Parameter(torch.Tensor(K, self.lamb_rem_num))
-                    )
-                )
+            self.unc_filt_RM_list += [nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(K, self.lamb_num)) * self.scale) for _ in range(task_num - 1)]
 
             # ParameterListにしておく
             self.unc_filt_LM_list =  nn.ParameterList(self.unc_filt_LM_list)
             self.unc_filt_RM_list =  nn.ParameterList(self.unc_filt_RM_list)
-            self.weights_mat_LM_list = nn.ParameterList(self.weights_mat_LM_list)
-            self.weights_mat_RM_list = nn.ParameterList(self.weights_mat_RM_list)
+
+            # lambda == 1はRKRに等しい
+            # その場合はweights_matは使用しない
+            if lambdas != 1.: 
+                # 重み行列((出力チャネル + タスク番号 * 非制約フィルタ数), piggybackフィルタ数)
+                # リストをtask0の値で初期化
+                self.weights_mat_LM_list = []
+                self.weights_mat_RM_list = []
+
+                for task in range(task_num - 1):
+                    # 重み行列のLM((出力チャネル + タスク番号 * 非制約フィルタ数), K)
+                    self.weights_mat_LM_list.append(
+                        nn.init.kaiming_uniform_(
+                            nn.Parameter(torch.Tensor((self.h_out + task * self.lamb_num), K))
+                        )
+                    )
+                    # 重み行列のRM(K, Piggybackフィルタ数)
+                    self.weights_mat_RM_list.append(
+                        nn.init.kaiming_uniform_(
+                            nn.Parameter(torch.Tensor(K, self.lamb_rem_num))
+                        )
+                    )
+                # ParameterListにしておく
+                self.weights_mat_LM_list = nn.ParameterList(self.weights_mat_LM_list)
+                self.weights_mat_RM_list = nn.ParameterList(self.weights_mat_RM_list)
 
             # 過去タスクの非制約フィルタを保存するためのリスト
             self.concat_unc_filter_list = [None] * task_num
@@ -114,8 +115,8 @@ class RG_FC(nn.Module):
     def forward(self, x, task: int):
         if self.RG:
             
-            if task == 0:
-                # RMとLMから非制約フィルタを生成（c_out, c_in）
+            if task == 0 or self.lambdas == 1.:
+                # RMとLMから非制約フィルタを生成（出力チャネル, 入力チャネル）
                 self.unc_filt = torch.matmul(self.unc_filt_LM_list[task], self.unc_filt_RM_list[task]).view(self.h_out, self.h_in)
                 # 非制約フィルタをストアするリストに追加
                 self.concat_unc_filter_list[task] = self.unc_filt
@@ -130,16 +131,16 @@ class RG_FC(nn.Module):
                 self.weights_mat = torch.matmul(self.weights_mat_LM_list[task], self.weights_mat_RM_list[task])
 
                 # フィルタバンクの設定
-                # 過去タスクの非制約フィルタをconcatする
+                # 過去タスクの非制約フィルタをconcatする（フィルタバンクのフィルタ数, 入力チャネル）
                 self.concat_unc_filter = torch.cat(self.concat_unc_filter_list[:task], dim=0)
-                # フィルタバンクのリシェイプ（フィルタバンクのフィルタ数, 入力チャネル）→（入力チャネル, フィルタバンクのフィルタ数）
+                # フィルタバンクのリシェイプ（入力チャネル, フィルタバンクのフィルタ数）
                 self.reshape_unc = torch.reshape(self.concat_unc_filter, (self.h_in, self.concat_unc_filter.shape[0]))
-                # フィルタバンクと重み行列の行列積（（入力チャネル * h * w）, piggybackフィルタ数）
+                # フィルタバンクと重み行列の行列積からpiggybackフィルタを作成（入力チャネル, piggybackフィルタ数）
                 self.reshape_unc_mul_w = torch.matmul(self.reshape_unc, self.weights_mat)
-                # piggybackフィルタのリシェイプ（入力チャネル, piggybackフィルタ数）→（piggybackフィルタ数, 入力チャネル）
+                # piggybackフィルタのリシェイプ（piggybackフィルタ数, 入力チャネル）
                 self.pb_filt = torch.reshape(self.reshape_unc_mul_w, (self.reshape_unc_mul_w.shape[1], self.h_in))
                 # 非制約フィルタとpiggybackフィルタを結合（出力フィルタ数, 入力チャネル数）
-                self.final_weight_mat = torch.cat((self.unc_filt, self.pb_filt),dim=0)
+                self.final_weight_mat = torch.cat((self.unc_filt, self.pb_filt), dim=0)
                 self.final_weight_mat = self.final_weight_mat.cuda()
                 
                 R = self.final_weight_mat
@@ -197,10 +198,10 @@ class Attention(nn.Module):
 
         self.RG, self.SFG = config.RG, config.SFG
 
-        self.query = RG_FC(self.RG, config.K, config.task_num, config.hidden_size, self.all_head_size, config.lamb)
-        self.key = RG_FC(self.RG, config.K, config.task_num, config.hidden_size, self.all_head_size, config.lamb)
-        self.value = RG_FC(self.RG, config.K, config.task_num, config.hidden_size, self.all_head_size, config.lamb)
-        self.out = RG_FC(self.RG, config.K, config.task_num, config.hidden_size, config.hidden_size, config.lamb)
+        self.query = RG_FC(self.RG, config.K, config.task_num, config.hidden_size, self.all_head_size, config.lamb, config.rkr_scale)
+        self.key = RG_FC(self.RG, config.K, config.task_num, config.hidden_size, self.all_head_size, config.lamb, config.rkr_scale)
+        self.value = RG_FC(self.RG, config.K, config.task_num, config.hidden_size, self.all_head_size, config.lamb, config.rkr_scale)
+        self.out = RG_FC(self.RG, config.K, config.task_num, config.hidden_size, config.hidden_size, config.lamb, config.rkr_scale)
 
         if self.SFG:
             self.SFG_query = SFG_FC(self.all_head_size, config.task_num)
@@ -255,8 +256,8 @@ class Mlp(nn.Module):
 
         self.RG, self.SFG = config.RG, config.SFG
 
-        self.fc1 = RG_FC(self.RG, config.K, config.task_num, config.hidden_size, config.transformer["mlp_dim"], config.lamb)
-        self.fc2 = RG_FC(self.RG, config.K, config.task_num, config.transformer["mlp_dim"], config.hidden_size, config.lamb)
+        self.fc1 = RG_FC(self.RG, config.K, config.task_num, config.hidden_size, config.transformer["mlp_dim"], config.lamb, config.rkr_scale)
+        self.fc2 = RG_FC(self.RG, config.K, config.task_num, config.transformer["mlp_dim"], config.hidden_size, config.lamb, config.rkr_scale)
 
         self._init_weights()
 
@@ -517,13 +518,13 @@ class VisionTransformer(nn.Module):
                     for uname, unit in block.named_children():
                         unit.load_from(weights, n_block=bname, n_unit=uname)
 
-
 CONFIGS = {
     'ViT-B_16': configs.get_b16_config(),
     'ViT-B_16_FC': configs.get_b16_FC_config(),
     'ViT-B_16_RKR': configs.get_b16_RKR_config(),
     'ViT-B_16_RKRnoRG': configs.get_b16_RKRnoRG_config(),
     'ViT-B_16_RKRnoSFG': configs.get_b16_RKRnoSFG_config(),
+    'ViT-B_16_RKR3_2': configs.get_b16_RKR3_2_config(),
     'ViT-B_32': configs.get_b32_config(),
     'ViT-L_16': configs.get_l16_config(),
     'ViT-L_32': configs.get_l32_config(),

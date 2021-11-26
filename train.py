@@ -16,15 +16,23 @@ import torch.distributed as dist
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from apex import amp
-from apex.parallel import DistributedDataParallel as DDP
+# from apex.parallel import DistributedDataParallel as DDP
 
 # from models.modeling import VisionTransformer, CONFIGS
-from models.modeling_RKR import VisionTransformer, CONFIGS
-from models.modeling_RKR3_2 import VisionTransformer as VisionTransformer_RKR3_2
+from models.modeling_RKR import VisionTransformer
+from models.modeling_RKR3_2 import VisionTransformer as VisionTransformer_RKR3_2, CONFIGS
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
 from utils.data_utils import get_loader, get_loader_splitCifar100, get_loader_splitImagenet, get_VD_loader
 from utils.dist_util import get_world_size
 
+# DDP
+from argparse import ArgumentParser
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = True
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +76,9 @@ def setup(args):
     if args.lamb != None:
         config.lamb = args.lamb
 
+    if args.rkr_scale != None:
+        config.rkr_scale = args.rkr_scale
+
     num_tasks = 10
     if args.dataset == "cifar100":
         num_classes = [10] * 10
@@ -76,19 +87,25 @@ def setup(args):
     elif args.dataset == "VD":
         num_classes = [1000, 100, 100, 2, 47, 43, 1623, 10, 101, 102]
 
-    if args.model_type == 'ViT-B_16_RKR3_2':
-        model = VisionTransformer_RKR3_2(config, args.img_size, zero_head=True, num_classes=num_classes)
-    else:
-        model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes)
+    model = VisionTransformer_RKR3_2(config, args.img_size, zero_head=True, num_classes=num_classes)
 
     # print(model)
     # print(list(np.load(args.pretrained_dir)))
     # for name, param in model.named_parameters():
     #     print(name)
-    # sys.exit()
+
     model.load_from(np.load(args.pretrained_dir))
     model.to(args.device)
     num_params = count_parameters(model)
+
+    # Distributed training
+    if args.local_rank != -1:
+        # DDP
+        model = DDP(
+                model,
+                find_unused_parameters = True,
+                device_ids=[args.local_rank]
+            )
 
     logger.info("{}".format(config))
     logger.info("Training parameters %s", args)
@@ -108,21 +125,24 @@ def set_seed(args):
     torch.manual_seed(args.seed)
     if args.n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = True
 
 
-def valid(args, model, writer, test_loader, global_step, task):
+def valid(args, model, test_loader, global_step, task):
     # Validation!
     eval_losses = AverageMeter()
 
     logger.info("\n***** Running Validation *****")
-
+    
     model.eval()
     all_preds, all_label = [], []
     epoch_iterator = tqdm(test_loader,
                           desc="Validating... (loss=X.X)",
                           bar_format="{l_bar}{r_bar}",
                           dynamic_ncols=True,
-                          disable=args.local_rank not in [-1, 0])
+                        #   disable=args.local_rank not in [-1, 0]
+                          )
     loss_fct = torch.nn.CrossEntropyLoss()
     for step, batch in enumerate(epoch_iterator):
         batch = tuple(t.to(args.device) for t in batch)
@@ -150,21 +170,23 @@ def valid(args, model, writer, test_loader, global_step, task):
     all_preds, all_label = all_preds[0], all_label[0]
     accuracy = simple_accuracy(all_preds, all_label)
 
+    # 他のノードから集める
+    dist.all_reduce(torch.tensor(accuracy).to(args.device), op=dist.ReduceOp.SUM)
     print("\n")
     logger.info("Task%d Validation Results" % task)
     logger.info("Global Steps: %d" % global_step)
     logger.info("Valid Loss: %2.5f" % eval_losses.avg)
     logger.info("Valid Accuracy: %2.5f" % accuracy)
 
-    writer.add_scalar("test/accuracy", scalar_value=accuracy, global_step=global_step)
+    # writer.add_scalar("test/accuracy", scalar_value=accuracy, global_step=global_step)
     return accuracy
 
 
 def train(args, model):
     """ Train the model """
-    if args.local_rank in [-1, 0]:
-        os.makedirs(args.output_dir, exist_ok=True)
-        writer = SummaryWriter(log_dir=os.path.join("logs", args.name))
+    # if args.local_rank in [-1, 0]:
+    #     os.makedirs(args.output_dir, exist_ok=True)
+    #     writer = SummaryWriter(log_dir=os.path.join("logs", args.name))
 
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
@@ -194,42 +216,25 @@ def train(args, model):
         else:
             scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
 
-        if args.fp16:
-            model, optimizer = amp.initialize(models=model,
-                                            optimizers=optimizer,
-                                            opt_level=args.fp16_opt_level)
-            amp._amp_state.loss_scalers[0]._loss_scale = 2**20
-
-        # Distributed training
-        if args.local_rank != -1:
-            model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
-
+        # if args.fp16:
+        #     model, optimizer = amp.initialize(models=model,
+        #                                     optimizers=optimizer,
+        #                                     opt_level=args.fp16_opt_level)
+        #     amp._amp_state.loss_scalers[0]._loss_scale = 2**20
         
-        if 'RKR3' in args.model_type:
-            for name, param in model.named_parameters():
-                param.requires_grad = False
-                if 'F_list' in name or 'RM_list' in name or 'LM_list' in name:
-                    if name.split('.')[-1] == str(task):
-                        param.requires_grad = True
-                if 'head' in name:
-                    if name.split('.')[-2] == str(task):
-                        param.requires_grad = True
-                elif 'unc_filt' in name or 'weights_mat' in name:
-                    if name.split('.')[-1] == str(task):
-                        param.requires_grad = True
-        else:
-            for name, param in model.named_parameters():
-                param.requires_grad = False
-                if 'head' in name:
-                    if name.split('.')[-2] == str(task):
-                        param.requires_grad = True
-                if 'F_list' in name or 'RM_list' in name or 'LM_list' in name:
-                    if name.split('.')[-1] == str(task):
-                        param.requires_grad = True
 
         for name, param in model.named_parameters():
-            if param.requires_grad == True:
-                print(name, end='')
+            param.requires_grad = False
+            if 'F_list' in name or 'RM_list' in name or 'LM_list' in name:
+                if name.split('.')[-1] == str(task):
+                    param.requires_grad = True
+            if 'head' in name:
+                if name.split('.')[-2] == str(task):
+                    param.requires_grad = True
+
+        # for name, param in model.named_parameters():
+        #     if param.requires_grad == True:
+        #         logger.info(name)
 
         # Train!
         logger.info("\n***** Running training *****")
@@ -248,12 +253,14 @@ def train(args, model):
         losses = AverageMeter()
         global_step, best_acc = 0, 0
         while True:
+            dist.barrier()
             model.train()
             epoch_iterator = tqdm(train_loader,
                                 desc="Training (X / X Steps) (loss=X.X)",
                                 bar_format="{l_bar}{r_bar}",
                                 dynamic_ncols=True,
-                                disable=args.local_rank not in [-1, 0])
+                                # disable=args.local_rank not in [-1, 0]
+                                )
             for step, batch in enumerate(epoch_iterator):
                 batch = tuple(t.to(args.device) for t in batch)
                 x, y = batch
@@ -273,35 +280,41 @@ def train(args, model):
                         torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
                     else:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                    scheduler.step()
                     optimizer.step()
+                    scheduler.step()
                     optimizer.zero_grad()
                     global_step += 1
 
                     epoch_iterator.set_description(
                         "Training%d (%d / %d Steps) (loss=%2.5f)" % (task, global_step, t_total, losses.val)
                     )
-                    if args.local_rank in [-1, 0]:
-                        writer.add_scalar("train/loss{}".format(task), scalar_value=losses.val, global_step=global_step)
-                        writer.add_scalar("train/lr{}".format(task), scalar_value=scheduler.get_lr()[0], global_step=global_step)
-                    if global_step % args.eval_every == 0 and args.local_rank in [-1, 0]:
-                        accuracy = valid(args, model, writer, test_loader, global_step, task)
+                    # if args.local_rank in [-1, 0]:
+                    #     writer.add_scalar("train/loss{}".format(task), scalar_value=losses.val, global_step=global_step)
+                    #     writer.add_scalar("train/lr{}".format(task), scalar_value=scheduler.get_lr()[0], global_step=global_step)
+                    if global_step % args.eval_every == 0:
+                    # if global_step % args.eval_every == 0 and args.local_rank in [-1, 0]:
+                        accuracy = valid(args, model, test_loader, global_step, task)
                         if best_acc < accuracy:
-                            save_model(args, model, task)
+                            # save_model(args, model, task)
                             best_acc = accuracy
                         model.train()
 
+                    dist.barrier()
                     if global_step % t_total == 0:
                         break
+
             losses.reset()
             if global_step % t_total == 0:
                 break
 
+        # DDP
+        dist.all_reduce(torch.tensor(best_acc).to(args.device), op=dist.ReduceOp.SUM)
+
         logger.info("Task%d Best Accuracy: \t%f" % (task, best_acc))
         logger.info("End Training!")
 
-    if args.local_rank in [-1, 0]:
-        writer.close()
+    # if args.local_rank in [-1, 0]:
+    #     writer.close()
 
 
 def main():
@@ -347,12 +360,12 @@ def main():
     parser.add_argument("--max_grad_norm", default=1.0, type=float,
                         help="Max gradient norm.")
 
-    parser.add_argument("--lamb", default=None, type=float,
-                        help="use only RKR3_2")
+    parser.add_argument("--lamb", default=None, type=float, help="use only RKR3_2")
+    parser.add_argument("--rkr_scale", default=None, type=float, help="")
 
-    parser.add_argument('--gpu_id', type=str, default='0', help='gpu id: e.g. 0 1. use -1 for CPU')
+    parser.add_argument('--gpu_id', type=str, default=None, help='gpu id: e.g. 0 1. use -1 for CPU')
 
-    parser.add_argument("--local_rank", type=int, default=-1,
+    parser.add_argument("--local_rank", type=int, default=0,
                         help="local_rank for distributed training on gpus")
     parser.add_argument('--seed', type=int, default=100, # 42
                         help="random seed for initialization")
@@ -369,7 +382,15 @@ def main():
                              "Positive power of 2: static loss scaling value.\n")
     args = parser.parse_args()
 
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
+    if args.gpu_id != None:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
+
+    # DDP
+    torch.cuda.set_device(args.local_rank)  
+    dist.init_process_group(backend='nccl', init_method='env://')
+    args.world_size = args.n_gpu = torch.cuda.device_count()
+    args.is_master = args.local_rank == 0
+
 
     #handler2を作成
     handler = logging.FileHandler(filename="./logfile/{}.log".format(args.name))  #handler2はファイル出力
@@ -381,16 +402,17 @@ def main():
 
 
     # Setup CUDA, GPU & distributed training
-    if args.local_rank == -1:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        args.n_gpu = torch.cuda.device_count()
-    else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
-        torch.cuda.set_device(args.local_rank)
-        device = torch.device("cuda", args.local_rank)
-        torch.distributed.init_process_group(backend='nccl',
-                                             timeout=timedelta(minutes=60))
-        args.n_gpu = 1
-    args.device = device
+    # if args.local_rank == -1:
+    #     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    #     args.n_gpu = torch.cuda.device_count()
+    # else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+    #     torch.cuda.set_device(args.local_rank)
+    #     device = torch.device("cuda", args.local_rank)
+    #     torch.distributed.init_process_group(backend='nccl',
+    #                                          timeout=timedelta(minutes=60))
+    #     args.n_gpu = torch.cuda.device_count()
+
+    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Setup logging
     logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
@@ -411,3 +433,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+    # destrory all processes
+    dist.destroy_process_group()

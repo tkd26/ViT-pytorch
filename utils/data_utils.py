@@ -51,8 +51,10 @@ def get_loader(args):
     if args.local_rank == 0:
         torch.distributed.barrier()
 
-    train_sampler = RandomSampler(trainset) if args.local_rank == -1 else DistributedSampler(trainset)
-    test_sampler = SequentialSampler(testset)
+    # train_sampler = RandomSampler(trainset) if args.local_rank == -1 else DistributedSampler(trainset, rank=args.local_rank, num_replicas=args.world_size)
+    # test_sampler = SequentialSampler(testset) if args.local_rank == -1 else DistributedSampler(testset, rank=args.local_rank, shuffle=False, num_replicas=args.world_size)
+    train_sampler = DistributedSampler(trainset, rank=args.local_rank, num_replicas=args.world_size)
+    test_sampler = DistributedSampler(testset, rank=args.local_rank, shuffle=False, num_replicas=args.world_size)
     train_loader = DataLoader(trainset,
                               sampler=train_sampler,
                               batch_size=args.train_batch_size,
@@ -127,24 +129,44 @@ def get_loader_splitCifar100(args, split_num):
         'worm'
     ]
 
-    trainset = torchvision.datasets.CIFAR100(root = './data', train = True, download = False)
-    testset = torchvision.datasets.CIFAR100(root = './data', train = False, download = False)
+    trainset_origin = torchvision.datasets.CIFAR100(root = './data', train = True, download = False)
+    testset_origin = torchvision.datasets.CIFAR100(root = './data', train = False, download = False)
 
     class_id_list = torch.chunk(torch.randperm(100), split_num)
-
-    train_sampler = RandomSampler(trainset) if args.local_rank == -1 else DistributedSampler(trainset)
-    test_sampler = SequentialSampler(testset)
 
     for i in range(split_num):
         # if i > 1:
         #     continue
         classes_list.append([classes[int(id)] for id in class_id_list[i]])
 
-        trainset_list.append(Mydatasets(origin=trainset, transform=train_transforms, class_id=class_id_list[i]))
-        trainloader_list.append(DataLoader(trainset_list[i], batch_size=args.train_batch_size, shuffle=True, num_workers=4, pin_memory=True))
+        trainset = Mydatasets(origin=trainset_origin, transform=train_transforms, class_id=class_id_list[i])
+        testset = Mydatasets(origin=testset_origin, transform=test_transforms, class_id=class_id_list[i])
+        
+        trainset_list.append(trainset)
+        testset_list.append(testset)
 
-        testset_list.append(Mydatasets(origin=testset, transform=test_transforms, class_id=class_id_list[i]))
-        testloader_list.append(DataLoader(testset_list[i], batch_size=args.eval_batch_size, shuffle=False, num_workers=4, pin_memory=True))
+        # train_sampler = RandomSampler(trainset) if args.local_rank == -1 else DistributedSampler(trainset, rank=args.local_rank)
+        # test_sampler = SequentialSampler(testset)
+        train_sampler = DistributedSampler(trainset, rank=args.local_rank, num_replicas=args.world_size)
+        test_sampler = DistributedSampler(testset, rank=args.local_rank, shuffle=False, num_replicas=args.world_size)
+
+        trainloader_list.append(
+            DataLoader(
+                trainset, 
+                batch_size=args.train_batch_size, 
+                # shuffle=True, 
+                sampler=train_sampler,
+                num_workers=4, 
+                pin_memory=True))
+
+        testloader_list.append(
+            DataLoader(
+                testset, 
+                batch_size=args.eval_batch_size, 
+                # shuffle=False, 
+                sampler=test_sampler,
+                num_workers=4, 
+                pin_memory=True))
         print('task{} dataset loaded'.format(i))
 
     return trainloader_list, testloader_list, classes_list
