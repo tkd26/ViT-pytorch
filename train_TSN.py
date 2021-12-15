@@ -18,9 +18,9 @@ from torch.utils.tensorboard import SummaryWriter
 from apex import amp
 # from apex.parallel import DistributedDataParallel as DDP
 
-from models.modeling import VisionTransformer
-from models.modeling_RKR import VisionTransformer as VisionTransformer_RKR, CONFIGS
-from models.modeling_PB import VisionTransformer as VisionTransformer_PB
+# from models.modeling import VisionTransformer, CONFIGS
+from models.modeling_RKR import VisionTransformer, CONFIGS
+from models.modeling_RKRTSN import VisionTransformer as VisionTransformer_RKRTSN, TaskEmbedding
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
 from utils.data_utils import get_loader, get_loader_splitCifar100, get_loader_splitImagenet, get_VD_loader
 from utils.dist_util import get_world_size
@@ -66,9 +66,9 @@ def save_model(args, model, task):
     logger.info("Saved model checkpoint to [DIR: %s]", args.output_dir)
 
 
-def setup(args, task=0):
+def setup(args):
     # Prepare model
-    config = CONFIGS[args.model_type] # modeling_RKR.pyのCONFIGS
+    config = CONFIGS[args.model_type]
 
     if args.lamb != None:
         config.lamb = args.lamb
@@ -76,8 +76,8 @@ def setup(args, task=0):
     if args.rkr_scale != None:
         config.rkr_scale = args.rkr_scale
 
-    if args.K != None:
-        config.K = args.K
+    if args.task_emb_d != None:
+        config.task_emb_d = args.task_emb_d
 
     if args.dataset == "cifar100":
         num_classes = [10] * 10
@@ -85,19 +85,16 @@ def setup(args, task=0):
         num_classes = [100] * 10
     elif args.dataset == "VD":
         num_classes = [1000, 100, 100, 2, 47, 43, 1623, 10, 101, 102]
+
     config.task_num = len(num_classes)
 
-    if args.model_type == 'ViT-B_16':
-        model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes[task])
-    elif args.model_type == 'ViT-B_16_PB':
-        model = VisionTransformer_PB(config, args.img_size, zero_head=True, num_classes=num_classes)
-    else:
-        model = VisionTransformer_RKR(config, args.img_size, zero_head=True, num_classes=num_classes)
+    if args.model_type == 'ViT-B_16_RKRTSN':
+        model = VisionTransformer_RKRTSN(config, args.img_size, num_classes=num_classes, zero_head=True)
 
     # print(model)
     # print(list(np.load(args.pretrained_dir)))
     # for name, param in model.named_parameters():
-    #     logger.info(name)
+    #     print(name)
 
     model.load_from(np.load(args.pretrained_dir))
     model.to(args.device)
@@ -115,10 +112,8 @@ def setup(args, task=0):
     logger.info("{}".format(config))
     logger.info("Training parameters %s", args)
     logger.info("Total Parameter: \t%2.1fM" % num_params)
-    if args.model_type == 'ViT-B_16_PB':
-        params, mask_params = count_parameters_PB(model)
-        logger.info("Total Parameter: \t%2.1fM + \t%2.1fM = \t%2.1fM" % (params, mask_params, params + mask_params))
-    return args, model, config
+    print(num_params)
+    return args, config, model
 
 
 def count_parameters(model):
@@ -126,11 +121,6 @@ def count_parameters(model):
     # params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return params/1000000
 
-def count_parameters_PB(model):
-    params = sum(p.numel() for name, p in model.named_parameters() if 'mask_reals' not in name)
-    mask_params = sum(p.numel() for name, p in model.named_parameters() if 'mask_reals' in name)
-    mask_params /= 32 # cnnのパラメータは32bit，バイナリマスクは1bitなので，1/32になる
-    return params/1000000, mask_params/1000000
 
 def set_seed(args):
     random.seed(args.seed)
@@ -142,7 +132,7 @@ def set_seed(args):
     torch.backends.cudnn.benchmark = False
 
 
-def valid(args, model, test_loader, global_step, task):
+def valid(args, config, model, test_loader, global_step, task):
     # Validation!
     eval_losses = AverageMeter()
 
@@ -157,11 +147,29 @@ def valid(args, model, test_loader, global_step, task):
                         #   disable=args.local_rank not in [-1, 0]
                           )
     loss_fct = torch.nn.CrossEntropyLoss()
+
+    # タスクベクトルの生成（one-hot）
+    # 1ではなく乱数が入っている
+    task_onehot = torch.eye(config.task_emb_d)
+    rand_vecs = torch.randn(config.task_emb_d, config.task_emb_d)
+    task_onehot = torch.mul(task_onehot, rand_vecs)
+    # タスクごとにどのインデックスを使用するか
+    idxs = torch.randperm(config.task_emb_d).reshape(config.task_num, -1)
+
+    task_vecs = [] # タスク埋め込みに与えるタスクベクトルの初期化
+    for task_idx in range(config.task_num):
+        task_vec = torch.zeros(config.task_emb_d)
+        for idx in idxs[task_idx]:
+            task_vec += task_onehot[idx]
+        task_vecs.append(task_vec)
+
+    task_vecs = torch.stack(task_vecs, dim=0).to(args.device)
+
     for step, batch in enumerate(epoch_iterator):
         batch = tuple(t.to(args.device) for t in batch)
         x, y = batch
         with torch.no_grad():
-            logits = model(x, task=task)[0]
+            logits = model(x, task=task, task_vecs=task_vecs)[0]
 
             eval_loss = loss_fct(logits, y)
             eval_losses.update(eval_loss.item())
@@ -196,7 +204,7 @@ def valid(args, model, test_loader, global_step, task):
     return accuracy
 
 
-def train(args, model, config):
+def train(args, config, model):
     """ Train the model """
     # if args.local_rank in [-1, 0]:
     #     os.makedirs(args.output_dir, exist_ok=True)
@@ -212,41 +220,36 @@ def train(args, model, config):
         train_loader_list, test_loader_list, classes_list  = get_loader_splitImagenet(args, split_num = 10)
     elif args.dataset == 'VD':
         train_loader_list, test_loader_list, classes_list  = get_VD_loader(args)
+    
+    # タスクベクトルの生成（one-hot）
+    # 1ではなく乱数が入っている
+    task_onehot = torch.eye(config.task_emb_d)
+    rand_vecs = torch.randn(config.task_emb_d, config.task_emb_d)
+    task_onehot = torch.mul(task_onehot, rand_vecs)
+    # タスクごとにどのインデックスを使用するか
+    idxs = torch.randperm(config.task_emb_d).reshape(config.task_num, -1)
+
+    task_vecs = [] # タスク埋め込みに与えるタスクベクトルの初期化
+    for task_idx in range(config.task_num):
+        task_vec = torch.zeros(config.task_emb_d)
+        for idx in idxs[task_idx]:
+            task_vec += task_onehot[idx]
+        task_vecs.append(task_vec)
+
+    task_vecs = torch.stack(task_vecs, dim=0).to(args.device)
 
     for task in range(args.start_task, config.task_num):
-
-        if args.model_type == 'ViT-B_16' and task != 0:
-            args, model, _ = setup(args, task)
 
         train_loader = train_loader_list[task]
         test_loader = test_loader_list[task]
 
-        # MultiHead2での設定
-        if args.model_type == 'ViT-B_16_MultiHead' and 'MultiHead2' in args.name: 
-            if task == 0:
-                for name, param in model.named_parameters():
-                    param.requires_grad = True
-                    if 'head' in name:
-                        if name.split('.')[-2] != str(task):
-                            param.requires_grad = False
-            else:
-                for name, param in model.named_parameters():
-                    param.requires_grad = False
-                    if 'head' in name:
-                        if name.split('.')[-2] == str(task):
-                            param.requires_grad = True 
-
-        elif args.model_type == 'ViT-B_16_PB':
+        if task == 0:
             for name, param in model.named_parameters():
-                param.requires_grad = False
-                if 'mask_reals' in name:
-                    if name.split('.')[-1] == str(task):
-                        param.requires_grad = True
+                param.requires_grad = True
                 if 'head' in name:
-                    if name.split('.')[-2] == str(task):
-                        param.requires_grad = True
-
-        elif args.model_type != 'ViT-B_16':
+                    if name.split('.')[-2] != str(task):
+                        param.requires_grad = False
+        else:
             for name, param in model.named_parameters():
                 param.requires_grad = False
                 if 'F_list' in name:
@@ -255,24 +258,19 @@ def train(args, model, config):
                 if 'head' in name:
                     if name.split('.')[-2] == str(task):
                         param.requires_grad = True
-                if 'LM_list' in name or 'RM_list' in name:
-                    if name.split('.')[-1] == str(task):
-                        param.requires_grad = True
+                if 'task_embedding' in name:
+                    param.requires_grad = True
+                # LM_fcとRM_fcは固定
 
-        for name, param in model.named_parameters():
-            if param.requires_grad == True:
-                logger.info(name)
+        # for name, param in model.named_parameters():
+        #     if param.requires_grad == True:
+        #         logger.info(name)
 
         # Prepare optimizer and scheduler
         optimizer = torch.optim.SGD(model.parameters(),
                                     lr=args.learning_rate,
                                     momentum=0.9,
                                     weight_decay=args.weight_decay)
-
-        # optimizer_masks = optim.Adam(
-        #     model.shared.parameters(), lr=args.lr_mask)
-        # optimizer_classifier = optim.Adam(
-        #     model.classifier.parameters(), lr=args.lr_classifier)
         
         t_total = args.num_steps
         if args.decay_type == "cosine":
@@ -293,9 +291,10 @@ def train(args, model, config):
         logger.info("  Eval Batch size = %d", args.eval_batch_size)
 
         optimizer.zero_grad()
-        model.zero_grad()
         set_seed(args)  # Added here for reproducibility (even between python 2 and 3)
         losses = AverageMeter()
+        losses_task = AverageMeter()
+        losses_distill = AverageMeter()
         global_step, best_acc = 0, 0
         while True:
             if args.local_rank != -1:
@@ -310,36 +309,35 @@ def train(args, model, config):
             for step, batch in enumerate(epoch_iterator):
                 batch = tuple(t.to(args.device) for t in batch)
                 x, y = batch
-                loss = model(x, y, task)
 
-                if args.gradient_accumulation_steps > 1:
-                    loss = loss / args.gradient_accumulation_steps
-                if args.fp16:
-                    with amp.scale_loss(loss, optimizer) as scaled_loss:
-                        scaled_loss.backward()
-                else:
-                    loss.backward()
+                loss_task, loss_distill = model(x, y, task, task_vecs)
+
+                loss = loss_task + config.lamb * loss_distill
+                
+                loss.backward()
+
+                losses_task.update(loss_task.item()*args.gradient_accumulation_steps)
+                losses_distill.update(loss_distill.item()*args.gradient_accumulation_steps)
+                losses.update(loss.item()*args.gradient_accumulation_steps)
+
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                global_step += 1
 
                 if (step + 1) % args.gradient_accumulation_steps == 0:
-                    losses.update(loss.item()*args.gradient_accumulation_steps)
-                    if args.fp16:
-                        torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
-                    else:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                    optimizer.step()
-                    scheduler.step()
-                    optimizer.zero_grad()
-                    global_step += 1
-
                     epoch_iterator.set_description(
-                        "Training%d (%d / %d Steps) (loss=%2.5f)" % (task, global_step, t_total, losses.val)
+                        "Training%d (%d / %d Steps) (loss_task=%2.5f, loss_dis=%2.5f, loss=%2.5f)" 
+                        % (task, global_step, t_total, losses_task.val, losses_distill.val, losses.val)
                     )
                     # if args.local_rank in [-1, 0]:
                     #     writer.add_scalar("train/loss{}".format(task), scalar_value=losses.val, global_step=global_step)
                     #     writer.add_scalar("train/lr{}".format(task), scalar_value=scheduler.get_lr()[0], global_step=global_step)
                     if global_step % args.eval_every == 0:
                     # if global_step % args.eval_every == 0 and args.local_rank in [-1, 0]:
-                        accuracy = valid(args, model, test_loader, global_step, task)
+                        accuracy = valid(args, config, model, test_loader, global_step, task)
                         if best_acc < accuracy:
                             # save_model(args, model, task)
                             best_acc = accuracy
@@ -361,6 +359,12 @@ def train(args, model, config):
         logger.info("Task%d Best Accuracy: \t%f" % (task, best_acc))
         logger.info("End Training!")
 
+    for task in range(config.task_num):
+        global_step = 0
+        test_loader = test_loader_list[task]
+        accuracy = valid(args, config, model, test_loader, global_step, task)
+        logger.info("Task%d Last Accuracy: \t%f" % (task, accuracy))
+
     # if args.local_rank in [-1, 0]:
     #     writer.close()
 
@@ -373,9 +377,9 @@ def main():
     parser.add_argument("--dataset", choices=["cifar10", "cifar100", "imagenet", 'VD'], default="cifar10",
                         help="Which downstream task.")
     parser.add_argument("--model_type", choices=[
-        "ViT-B_16", "ViT-B_16_MultiHead", 
+        "ViT-B_16", "ViT-B_16_FC", 
         "ViT-B_16_RKR", "ViT-B_16_RKRnoRG", "ViT-B_16_RKRnoSFG",
-        "ViT-B_16_PB",
+        "ViT-B_16_RKRTSN",
         "ViT-B_32", "ViT-L_16", "ViT-L_32", "ViT-H_14", "R50-ViT-B_16"],
                         default="ViT-B_16",
                         help="Which variant to use.")
@@ -410,7 +414,7 @@ def main():
 
     parser.add_argument("--lamb", default=None, type=float, help="")
     parser.add_argument("--rkr_scale", default=None, type=float, help="")
-    parser.add_argument("--K", default=None, type=int, help="")
+    parser.add_argument("--task_emb_d", default=None, type=int, help="")
 
     parser.add_argument('--gpu_id', type=str, default=None, help='gpu id: e.g. 0 1. use -1 for CPU')
 
@@ -452,6 +456,7 @@ def main():
     #loggerにハンドラを設定
     logger.addHandler(handler)
 
+
     # Setup CUDA, GPU & distributed training
     # if args.local_rank == -1:
     #     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -473,10 +478,10 @@ def main():
                    (args.local_rank, args.device, args.n_gpu, bool(args.local_rank != -1), args.fp16))
 
     # Model & Tokenizer Setup
-    args, model, config = setup(args)
+    args, config, model = setup(args)
 
     # Training
-    train(args, model, config)
+    train(args, config, model)
 
 
 if __name__ == "__main__":

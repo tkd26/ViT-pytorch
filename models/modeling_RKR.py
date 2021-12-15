@@ -438,11 +438,14 @@ class VisionTransformer(nn.Module):
 
 CONFIGS = {
     'ViT-B_16': configs.get_b16_config(),
-    'ViT-B_16_FC': configs.get_b16_FC_config(),
+    'ViT-B_16_MultiHead': configs.get_b16_MultiHead_config(),
     'ViT-B_16_RKR': configs.get_b16_RKR_config(),
     'ViT-B_16_RKRnoRG': configs.get_b16_RKRnoRG_config(),
     'ViT-B_16_RKRnoSFG': configs.get_b16_RKRnoSFG_config(),
-    'ViT-B_16_RKR3_2': configs.get_b16_RKR3_2_config(),
+    'ViT-B_16_RKRTSN': configs.get_b16_RKRTSN_config(),
+    'ViT-B_16_PB': configs.get_b16_PB_config(),
+    'ViT-B_16_RKRPBG': configs.get_b16_RKRPBG_config(),
+    'ViT-B_16_PBG': configs.get_b16_PBG_config(),
     'ViT-B_32': configs.get_b32_config(),
     'ViT-L_16': configs.get_l16_config(),
     'ViT-L_32': configs.get_l32_config(),

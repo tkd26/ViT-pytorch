@@ -18,9 +18,10 @@ from torch.utils.tensorboard import SummaryWriter
 from apex import amp
 # from apex.parallel import DistributedDataParallel as DDP
 
-from models.modeling import VisionTransformer
-from models.modeling_RKR import VisionTransformer as VisionTransformer_RKR, CONFIGS
-from models.modeling_PB import VisionTransformer as VisionTransformer_PB
+# from models.modeling import VisionTransformer, CONFIGS
+from models.modeling_RKR import VisionTransformer, CONFIGS
+from models.modeling_RKRPBG import VisionTransformer as VisionTransformer_RKRPBG
+from models.modeling_PBG import VisionTransformer as VisionTransformer_PBG
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
 from utils.data_utils import get_loader, get_loader_splitCifar100, get_loader_splitImagenet, get_VD_loader
 from utils.dist_util import get_world_size
@@ -66,7 +67,7 @@ def save_model(args, model, task):
     logger.info("Saved model checkpoint to [DIR: %s]", args.output_dir)
 
 
-def setup(args, task=0):
+def setup(args, task, all_task_specific_param):
     # Prepare model
     config = CONFIGS[args.model_type] # modeling_RKR.pyのCONFIGS
 
@@ -76,32 +77,28 @@ def setup(args, task=0):
     if args.rkr_scale != None:
         config.rkr_scale = args.rkr_scale
 
-    if args.K != None:
-        config.K = args.K
-
     if args.dataset == "cifar100":
         num_classes = [10] * 10
     elif args.dataset == "imagenet":
         num_classes = [100] * 10
     elif args.dataset == "VD":
         num_classes = [1000, 100, 100, 2, 47, 43, 1623, 10, 101, 102]
+
     config.task_num = len(num_classes)
 
-    if args.model_type == 'ViT-B_16':
-        model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes[task])
-    elif args.model_type == 'ViT-B_16_PB':
-        model = VisionTransformer_PB(config, args.img_size, zero_head=True, num_classes=num_classes)
-    else:
-        model = VisionTransformer_RKR(config, args.img_size, zero_head=True, num_classes=num_classes)
+    # model = VisionTransformer_RKR3_2(config, args.img_size, zero_head=True, num_classes=num_classes)
+    if args.model_type == 'ViT-B_16_RKRPBG':
+        model = VisionTransformer_RKRPBG(config, args.img_size, zero_head=True, num_classes=num_classes, task=task)
+        model.load_from(np.load(args.pretrained_dir))
+    elif args.model_type == 'ViT-B_16_PBG':
+        model = VisionTransformer_PBG(config, args.img_size, zero_head=True, num_classes=num_classes, task=task)
+        if task == 0:
+            model.load_from(np.load(args.pretrained_dir))
 
-    # print(model)
-    # print(list(np.load(args.pretrained_dir)))
-    # for name, param in model.named_parameters():
-    #     logger.info(name)
-
-    model.load_from(np.load(args.pretrained_dir))
     model.to(args.device)
     num_params = count_parameters(model)
+    global_param, task_specific_param = count_task_parameters(model)
+    all_task_specific_param += task_specific_param
 
     # Distributed training
     if args.local_rank != -1:
@@ -114,23 +111,36 @@ def setup(args, task=0):
 
     logger.info("{}".format(config))
     logger.info("Training parameters %s", args)
-    logger.info("Total Parameter: \t%2.1fM" % num_params)
-    if args.model_type == 'ViT-B_16_PB':
-        params, mask_params = count_parameters_PB(model)
-        logger.info("Total Parameter: \t%2.1fM + \t%2.1fM = \t%2.1fM" % (params, mask_params, params + mask_params))
-    return args, model, config
+    # logger.info("Total Parameter: \t%2.1fM" % num_params)
+    logger.info("Global Parameter: \t%2.1fM" % global_param)
+    logger.info("Task Specific Parameter: \t%2.1fM" % task_specific_param)
+    logger.info("All Task Specific Parameter: \t%2.1fM" % all_task_specific_param)
+    logger.info("Total Parameter: \t%2.1fM" % (global_param + all_task_specific_param))
+    return args, model, all_task_specific_param, config
 
 
 def count_parameters(model):
-    params = sum(p.numel() for p in model.parameters())
-    # params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return params/1000000
 
-def count_parameters_PB(model):
-    params = sum(p.numel() for name, p in model.named_parameters() if 'mask_reals' not in name)
-    mask_params = sum(p.numel() for name, p in model.named_parameters() if 'mask_reals' in name)
-    mask_params /= 32 # cnnのパラメータは32bit，バイナリマスクは1bitなので，1/32になる
-    return params/1000000, mask_params/1000000
+def count_task_parameters(model):
+    task_specific_params = []
+    global_params = []
+    for name, param in model.named_parameters():
+        if 'SFG_F' in name:
+            task_specific_params.append(param.numel())
+        elif 'head' in name:
+            task_specific_params.append(param.numel())
+        elif 'weights_mat' in name:
+            task_specific_params.append(param.numel())
+        elif 'unc_filt' in name and name != 'concat_unc_filter' and name != 'SFG_concat_unc_filter':
+            task_specific_params.append(param.numel())
+        else:
+            global_params.append(param.numel())
+    task_specific_param = sum(task_specific_params)
+    global_param = sum(global_params)
+    return global_param/1000000, task_specific_param/1000000
+
 
 def set_seed(args):
     random.seed(args.seed)
@@ -196,7 +206,7 @@ def valid(args, model, test_loader, global_step, task):
     return accuracy
 
 
-def train(args, model, config):
+def train(args):
     """ Train the model """
     # if args.local_rank in [-1, 0]:
     #     os.makedirs(args.output_dir, exist_ok=True)
@@ -213,66 +223,113 @@ def train(args, model, config):
     elif args.dataset == 'VD':
         train_loader_list, test_loader_list, classes_list  = get_VD_loader(args)
 
-    for task in range(args.start_task, config.task_num):
+    all_task_specific_param = 0
+    for task in range(args.start_task, 10):
 
-        if args.model_type == 'ViT-B_16' and task != 0:
-            args, model, _ = setup(args, task)
+        if task != 0:
+            pre_model_dict = model.state_dict()
+
+        args, model, all_task_specific_param, config = setup(args, task, all_task_specific_param)
+
+        if task != 0:
+            pre_model_keys = [k for k, v in pre_model_dict.items()]
+            model_dict = model.state_dict()
+            new_model_dict = {}
+            for k, v in model_dict.items():
+                if k in pre_model_keys and 'unc_filt' not in k:
+                    # print(k)
+                    new_model_dict[k] = pre_model_dict[k]
+                else:
+                    new_model_dict[k] = v
+            model.load_state_dict(new_model_dict)
 
         train_loader = train_loader_list[task]
         test_loader = test_loader_list[task]
 
-        # MultiHead2での設定
-        if args.model_type == 'ViT-B_16_MultiHead' and 'MultiHead2' in args.name: 
+        if args.model_type == 'ViT-B_16_RKRPBG':
+            if task == 0: # 試しに
+                for name, param in model.named_parameters():
+                    param.requires_grad = True
+            else:
+                for name, param in model.named_parameters():
+                    param.requires_grad = False
+                    if 'SFG_F' in name:
+                        param.requires_grad = True
+                    if 'head' in name:
+                        param.requires_grad = True
+                    if 'weights_mat' in name:
+                        param.requires_grad = True
+                    if 'unc_filt' in name:
+                        param.requires_grad = True
+        elif args.model_type == 'ViT-B_16_PBG':
             if task == 0:
                 for name, param in model.named_parameters():
                     param.requires_grad = True
-                    if 'head' in name:
-                        if name.split('.')[-2] != str(task):
-                            param.requires_grad = False
             else:
                 for name, param in model.named_parameters():
                     param.requires_grad = False
                     if 'head' in name:
-                        if name.split('.')[-2] == str(task):
-                            param.requires_grad = True 
-
-        elif args.model_type == 'ViT-B_16_PB':
-            for name, param in model.named_parameters():
-                param.requires_grad = False
-                if 'mask_reals' in name:
-                    if name.split('.')[-1] == str(task):
                         param.requires_grad = True
-                if 'head' in name:
-                    if name.split('.')[-2] == str(task):
+                    if 'weights_mat' in name:
+                        param.requires_grad = True
+                    if 'unc_filt' in name:
                         param.requires_grad = True
 
-        elif args.model_type != 'ViT-B_16':
-            for name, param in model.named_parameters():
-                param.requires_grad = False
-                if 'F_list' in name:
-                    if name.split('.')[-1] == str(task):
-                        param.requires_grad = True
-                if 'head' in name:
-                    if name.split('.')[-2] == str(task):
-                        param.requires_grad = True
-                if 'LM_list' in name or 'RM_list' in name:
-                    if name.split('.')[-1] == str(task):
-                        param.requires_grad = True
+        print('----------------------------')
+        # for name, param in model.named_parameters():
+        #     if 'concat_unc_filter' in name:
+        #         print(name)
 
-        for name, param in model.named_parameters():
-            if param.requires_grad == True:
-                logger.info(name)
+        if task != 0 and args.lamb != 1.:
+            state_dict_keys = model.state_dict().keys()
+            # for dict_name in state_dict_keys:
+            #     if 'concat_unc_filter' in dict_name:
+            #         print(dict_name)
+            
+            layer_list = list(model.transformer.encoder.layer)
+            # print(layer_list)
+            idx = 0
+
+            if 'SFG' in args.model_type:
+                for layer in layer_list:
+                    layer.ffn.SFG1.SFG_concat_unc_filter.data = torch.cat(unc_filter_dic[idx], dim=0)
+                    layer.ffn.SFG2.SFG_concat_unc_filter.data = torch.cat(unc_filter_dic[idx + 1], dim=0)
+                    layer.attn.SFG_query.SFG_concat_unc_filter.data = torch.cat(unc_filter_dic[idx + 2], dim=0)
+                    layer.attn.SFG_key.SFG_concat_unc_filter.data = torch.cat(unc_filter_dic[idx + 3], dim=0)
+                    layer.attn.SFG_value.SFG_concat_unc_filter.data = torch.cat(unc_filter_dic[idx + 4], dim=0)
+                    layer.attn.SFG_out.SFG_concat_unc_filter.data = torch.cat(unc_filter_dic[idx + 5], dim=0)
+                    idx += 6
+            else:
+                for layer in layer_list:
+                    layer.ffn.fc1.concat_unc_filter.data = torch.cat(unc_filter_dic[idx], dim=0)
+                    layer.ffn.fc2.concat_unc_filter.data = torch.cat(unc_filter_dic[idx + 1], dim=0)
+                    layer.attn.query.concat_unc_filter.data = torch.cat(unc_filter_dic[idx + 2], dim=0)
+                    layer.attn.key.concat_unc_filter.data = torch.cat(unc_filter_dic[idx + 3], dim=0)
+                    layer.attn.value.concat_unc_filter.data = torch.cat(unc_filter_dic[idx + 4], dim=0)
+                    layer.attn.out.concat_unc_filter.data = torch.cat(unc_filter_dic[idx + 5], dim=0)
+                    idx += 6
+
+        # RGの場合
+        # unc_filter_dic name transformer.encoder.layer.0.ffn.fc1.unc_filt_LM
+        # unc_filter_dic name transformer.encoder.layer.0.ffn.fc1.unc_filt_RM
+        # unc_filter_dic name transformer.encoder.layer.0.ffn.fc2.unc_filt_LM
+        # unc_filter_dic name transformer.encoder.layer.0.ffn.fc2.unc_filt_RM
+        # unc_filter_dic name transformer.encoder.layer.0.attn.query.unc_filt_LM
+        # unc_filter_dic name transformer.encoder.layer.0.attn.query.unc_filt_RM
+        # unc_filter_dic name transformer.encoder.layer.0.attn.key.unc_filt_LM
+        # unc_filter_dic name transformer.encoder.layer.0.attn.key.unc_filt_RM
+        # unc_filter_dic name transformer.encoder.layer.0.attn.value.unc_filt_LM
+        # unc_filter_dic name transformer.encoder.layer.0.attn.value.unc_filt_RM
+        # unc_filter_dic name transformer.encoder.layer.0.attn.out.unc_filt_LM
+        # unc_filter_dic name transformer.encoder.layer.0.attn.out.unc_filt_RM
+
+        print('----------------------------')
 
         # Prepare optimizer and scheduler
         optimizer = torch.optim.SGD(model.parameters(),
                                     lr=args.learning_rate,
                                     momentum=0.9,
                                     weight_decay=args.weight_decay)
-
-        # optimizer_masks = optim.Adam(
-        #     model.shared.parameters(), lr=args.lr_mask)
-        # optimizer_classifier = optim.Adam(
-        #     model.classifier.parameters(), lr=args.lr_classifier)
         
         t_total = args.num_steps
         if args.decay_type == "cosine":
@@ -361,6 +418,48 @@ def train(args, model, config):
         logger.info("Task%d Best Accuracy: \t%f" % (task, best_acc))
         logger.info("End Training!")
 
+        if args.lamb != 1.:
+            if args.model_type == 'ViT-B_16_RKRPBG':
+                # 非制約フィルタの中身を取り出す
+                unc_filter_LM_dic = {}
+                unc_filter_RM_dic = {}
+                filter_LM_idx = 0
+                filter_RM_idx = 0
+                for name, param in model.named_parameters():
+                    param.requires_grad = False
+                    if 'unc_filt_LM' in name:
+                        # print(name, '/', filter_LM_idx, param.shape)
+                        unc_filter_LM_dic[filter_LM_idx] = param.detach()
+                        filter_LM_idx += 1
+                    elif 'unc_filt_RM' in name:
+                        # print(name, '/', filter_RM_idx, param.shape)
+                        unc_filter_RM_dic[filter_RM_idx] = param.detach()
+                        filter_RM_idx += 1
+                filter_idx = filter_LM_idx
+
+                unc_filter_task_dic = {i: torch.matmul(unc_filter_LM_dic[i], unc_filter_RM_dic[i]) for i in range(filter_idx)}
+            
+            elif args.model_type == 'ViT-B_16_PBG':
+                # 非制約フィルタの中身を取り出す
+                unc_filter_dic = {}
+                filter_idx = 0
+                for name, param in model.named_parameters():
+                    param.requires_grad = False
+                    if 'unc_filt' in name:
+                        unc_filter_dic[filter_idx] = param.detach()
+                        filter_idx += 1
+
+                unc_filter_task_dic = {i: unc_filter_dic[i] for i in range(filter_idx)}
+
+            # 非制約フィルタの値をフィルタリストに入れる
+            if task == 0:
+                unc_filter_dic = {}
+                for i in range(filter_idx):
+                        unc_filter_dic[i] = [unc_filter_task_dic[i]]
+            else:
+                for i in range(filter_idx):
+                    unc_filter_dic[i].append(unc_filter_task_dic[i])
+
     # if args.local_rank in [-1, 0]:
     #     writer.close()
 
@@ -373,9 +472,9 @@ def main():
     parser.add_argument("--dataset", choices=["cifar10", "cifar100", "imagenet", 'VD'], default="cifar10",
                         help="Which downstream task.")
     parser.add_argument("--model_type", choices=[
-        "ViT-B_16", "ViT-B_16_MultiHead", 
+        "ViT-B_16", "ViT-B_16_FC", 
         "ViT-B_16_RKR", "ViT-B_16_RKRnoRG", "ViT-B_16_RKRnoSFG",
-        "ViT-B_16_PB",
+        "ViT-B_16_PBG", "ViT-B_16_RKRPBG",
         "ViT-B_32", "ViT-L_16", "ViT-L_32", "ViT-H_14", "R50-ViT-B_16"],
                         default="ViT-B_16",
                         help="Which variant to use.")
@@ -410,7 +509,6 @@ def main():
 
     parser.add_argument("--lamb", default=None, type=float, help="")
     parser.add_argument("--rkr_scale", default=None, type=float, help="")
-    parser.add_argument("--K", default=None, type=int, help="")
 
     parser.add_argument('--gpu_id', type=str, default=None, help='gpu id: e.g. 0 1. use -1 for CPU')
 
@@ -472,15 +570,12 @@ def main():
     logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s" %
                    (args.local_rank, args.device, args.n_gpu, bool(args.local_rank != -1), args.fp16))
 
-    # Model & Tokenizer Setup
-    args, model, config = setup(args)
-
     # Training
-    train(args, model, config)
+    train(args)
 
+    if args.local_rank != -1:
+        # destrory all processes
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()
-
-    # destrory all processes
-    dist.destroy_process_group()

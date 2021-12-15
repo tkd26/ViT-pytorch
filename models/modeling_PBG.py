@@ -12,6 +12,7 @@ from os.path import join as pjoin
 import torch
 import torch.nn as nn
 import numpy as np
+import math
 
 from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNorm
 from torch.nn.modules.utils import _pair
@@ -21,9 +22,9 @@ import models.configs as configs
 
 from .modeling_resnet import ResNetV2
 
+import sys
 
 logger = logging.getLogger(__name__)
-
 
 ATTENTION_Q = "MultiHeadDotProductAttention_1/query"
 ATTENTION_K = "MultiHeadDotProductAttention_1/key"
@@ -34,6 +35,42 @@ FC_1 = "MlpBlock_3/Dense_1"
 ATTENTION_NORM = "LayerNorm_0"
 MLP_NORM = "LayerNorm_2"
 
+class PiggybackFC(nn.Module):
+    def __init__(self, in_channels, out_channels, config, bias=True, task=0):
+        super(PiggybackFC, self).__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        if bias:
+            self.bias = nn.Parameter(torch.Tensor(self.out_channels))
+        else:
+            self.register_parameter('bias', None)
+        
+        self.task = task 
+        self.lambdas = config.lamb
+        self.lamb_num = math.ceil(self.lambdas*out_channels)
+        self.lamb_rem_num = out_channels - self.lamb_num
+
+        if self.task == 0:
+            self.unc_filt = nn.Parameter(torch.Tensor(self.out_channels, self.in_channels))
+        else: 
+            # after training, save unc_filt and weight_mat into files, so that u can use it now. 
+            
+            self.unc_filt = nn.Parameter(torch.Tensor(self.lamb_num, self.in_channels)) 
+            self.weights_mat = nn.Parameter(torch.Tensor((self.out_channels + (self.task-1)*self.lamb_num), self.lamb_rem_num))
+            # self.register_buffer('concat_unc_filter', torch.cat(unc_filt_list, dim=0))
+            self.register_buffer('concat_unc_filter', torch.Tensor(self.out_channels + (self.task - 1) * self.lamb_num, self.in_channels))
+
+    def forward(self, x, task):
+        if self.task == 0:
+            return nn.functional.linear(x, self.unc_filt, bias=self.bias)           
+        else:
+            self.reshape_unc = torch.reshape(self.concat_unc_filter, (self.concat_unc_filter.shape[1], self.concat_unc_filter.shape[0]))
+            self.reshape_unc_mul_w = torch.matmul(self.reshape_unc, self.weights_mat)
+            self.pb_filt = torch.reshape(self.reshape_unc_mul_w, (self.reshape_unc_mul_w.shape[1], self.concat_unc_filter.shape[1]))
+            self.final_weight_mat = torch.cat((self.unc_filt, self.pb_filt),dim=0)
+            self.final_weight_mat = self.final_weight_mat.to(x.device)
+
+            return nn.functional.linear(x, self.final_weight_mat, bias=self.bias)
 
 def np2th(weights, conv=False):
     """Possibly convert HWIO to OIHW."""
@@ -50,32 +87,38 @@ ACT2FN = {"gelu": torch.nn.functional.gelu, "relu": torch.nn.functional.relu, "s
 
 
 class Attention(nn.Module):
-    def __init__(self, config, vis):
+    def __init__(self, config, vis, task):
         super(Attention, self).__init__()
         self.vis = vis
         self.num_attention_heads = config.transformer["num_heads"]
         self.attention_head_size = int(config.hidden_size / self.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
-        self.query = Linear(config.hidden_size, self.all_head_size)
-        self.key = Linear(config.hidden_size, self.all_head_size)
-        self.value = Linear(config.hidden_size, self.all_head_size)
+        # self.query = Linear(config.hidden_size, self.all_head_size)
+        # self.key = Linear(config.hidden_size, self.all_head_size)
+        # self.value = Linear(config.hidden_size, self.all_head_size)
 
-        self.out = Linear(config.hidden_size, config.hidden_size)
+        # self.out = Linear(config.hidden_size, config.hidden_size)
         self.attn_dropout = Dropout(config.transformer["attention_dropout_rate"])
         self.proj_dropout = Dropout(config.transformer["attention_dropout_rate"])
 
         self.softmax = Softmax(dim=-1)
+
+        self.query = PiggybackFC(config.hidden_size, self.all_head_size, config, task=task)
+        self.key = PiggybackFC(config.hidden_size, self.all_head_size, config, task=task)
+        self.value = PiggybackFC(config.hidden_size, self.all_head_size, config, task=task)
+        self.out = PiggybackFC(config.hidden_size, config.hidden_size, config, task=task)
 
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3)
 
-    def forward(self, hidden_states):
-        mixed_query_layer = self.query(hidden_states)
-        mixed_key_layer = self.key(hidden_states)
-        mixed_value_layer = self.value(hidden_states)
+    def forward(self, hidden_states, task):
+
+        mixed_query_layer = self.query(hidden_states, task)
+        mixed_key_layer = self.key(hidden_states, task)
+        mixed_value_layer = self.value(hidden_states, task)
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
         key_layer = self.transpose_for_scores(mixed_key_layer)
@@ -91,32 +134,36 @@ class Attention(nn.Module):
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(*new_context_layer_shape)
-        attention_output = self.out(context_layer)
+        attention_output = self.out(context_layer, task)
+
         attention_output = self.proj_dropout(attention_output)
         return attention_output, weights
 
 
 class Mlp(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, task):
         super(Mlp, self).__init__()
-        self.fc1 = Linear(config.hidden_size, config.transformer["mlp_dim"])
-        self.fc2 = Linear(config.transformer["mlp_dim"], config.hidden_size)
+        # self.fc1 = Linear(config.hidden_size, config.transformer["mlp_dim"])
+        # self.fc2 = Linear(config.transformer["mlp_dim"], config.hidden_size)
         self.act_fn = ACT2FN["gelu"]
         self.dropout = Dropout(config.transformer["dropout_rate"])
+
+        self.fc1 = PiggybackFC(config.hidden_size, config.transformer["mlp_dim"], config, task=task)
+        self.fc2 = PiggybackFC(config.transformer["mlp_dim"], config.hidden_size, config, task=task)
 
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.xavier_uniform_(self.fc1.weight)
-        nn.init.xavier_uniform_(self.fc2.weight)
+        nn.init.xavier_uniform_(self.fc1.unc_filt)
+        nn.init.xavier_uniform_(self.fc2.unc_filt)
         nn.init.normal_(self.fc1.bias, std=1e-6)
         nn.init.normal_(self.fc2.bias, std=1e-6)
 
-    def forward(self, x):
-        x = self.fc1(x)
+    def forward(self, x, task):
+        x = self.fc1(x, task)
         x = self.act_fn(x)
         x = self.dropout(x)
-        x = self.fc2(x)
+        x = self.fc2(x, task)
         x = self.dropout(x)
         return x
 
@@ -169,23 +216,23 @@ class Embeddings(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, vis):
+    def __init__(self, config, vis, task):
         super(Block, self).__init__()
         self.hidden_size = config.hidden_size
         self.attention_norm = LayerNorm(config.hidden_size, eps=1e-6)
         self.ffn_norm = LayerNorm(config.hidden_size, eps=1e-6)
-        self.ffn = Mlp(config)
-        self.attn = Attention(config, vis)
+        self.ffn = Mlp(config, task)
+        self.attn = Attention(config, vis, task)
 
-    def forward(self, x):
+    def forward(self, x, task):
         h = x
         x = self.attention_norm(x)
-        x, weights = self.attn(x)
+        x, weights = self.attn(x, task)
         x = x + h
 
         h = x
         x = self.ffn_norm(x)
-        x = self.ffn(x)
+        x = self.ffn(x, task)
         x = x + h
         return x, weights
 
@@ -202,10 +249,10 @@ class Block(nn.Module):
             value_bias = np2th(weights[pjoin(ROOT, ATTENTION_V, "bias")]).view(-1)
             out_bias = np2th(weights[pjoin(ROOT, ATTENTION_OUT, "bias")]).view(-1)
 
-            self.attn.query.weight.copy_(query_weight)
-            self.attn.key.weight.copy_(key_weight)
-            self.attn.value.weight.copy_(value_weight)
-            self.attn.out.weight.copy_(out_weight)
+            self.attn.query.unc_filt.copy_(query_weight)
+            self.attn.key.unc_filt.copy_(key_weight)
+            self.attn.value.unc_filt.copy_(value_weight)
+            self.attn.out.unc_filt.copy_(out_weight)
             self.attn.query.bias.copy_(query_bias)
             self.attn.key.bias.copy_(key_bias)
             self.attn.value.bias.copy_(value_bias)
@@ -216,8 +263,8 @@ class Block(nn.Module):
             mlp_bias_0 = np2th(weights[pjoin(ROOT, FC_0, "bias")]).t()
             mlp_bias_1 = np2th(weights[pjoin(ROOT, FC_1, "bias")]).t()
 
-            self.ffn.fc1.weight.copy_(mlp_weight_0)
-            self.ffn.fc2.weight.copy_(mlp_weight_1)
+            self.ffn.fc1.unc_filt.copy_(mlp_weight_0)
+            self.ffn.fc2.unc_filt.copy_(mlp_weight_1)
             self.ffn.fc1.bias.copy_(mlp_bias_0)
             self.ffn.fc2.bias.copy_(mlp_bias_1)
 
@@ -228,19 +275,19 @@ class Block(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, config, vis):
+    def __init__(self, config, vis, task):
         super(Encoder, self).__init__()
         self.vis = vis
         self.layer = nn.ModuleList()
         self.encoder_norm = LayerNorm(config.hidden_size, eps=1e-6)
         for _ in range(config.transformer["num_layers"]):
-            layer = Block(config, vis)
+            layer = Block(config, vis, task)
             self.layer.append(copy.deepcopy(layer))
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, task):
         attn_weights = []
         for layer_block in self.layer:
-            hidden_states, weights = layer_block(hidden_states)
+            hidden_states, weights = layer_block(hidden_states, task)
             if self.vis:
                 attn_weights.append(weights)
         encoded = self.encoder_norm(hidden_states)
@@ -248,34 +295,42 @@ class Encoder(nn.Module):
 
 
 class Transformer(nn.Module):
-    def __init__(self, config, img_size, vis):
+    def __init__(self, config, img_size, vis, task):
         super(Transformer, self).__init__()
         self.embeddings = Embeddings(config, img_size=img_size)
-        self.encoder = Encoder(config, vis)
+        self.encoder = Encoder(config, vis, task)
 
-    def forward(self, input_ids):
+    def forward(self, input_ids, task):
         embedding_output = self.embeddings(input_ids)
-        encoded, attn_weights = self.encoder(embedding_output)
+        encoded, attn_weights = self.encoder(embedding_output, task)
         return encoded, attn_weights
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False):
+    def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False, task=0):
         super(VisionTransformer, self).__init__()
+
         self.num_classes = num_classes
+        self.num_tasks = len(num_classes)
         self.zero_head = zero_head
         self.classifier = config.classifier
+        self.multi_head = config.multi_head
 
-        self.transformer = Transformer(config, img_size, vis)
-        self.head = Linear(config.hidden_size, num_classes)
+        self.transformer = Transformer(config, img_size, vis, task)
+        self.head = Linear(config.hidden_size, num_classes[task])
 
     def forward(self, x, labels=None, task=None):
-        x, attn_weights = self.transformer(x)
+        x, attn_weights = self.transformer(x, task)
         logits = self.head(x[:, 0])
+
+        if type(self.num_classes) == list:
+            num_class = self.num_classes[task]
+        else:
+            num_class = self.num_classes
 
         if labels is not None:
             loss_fct = CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, self.num_classes), labels.view(-1))
+            loss = loss_fct(logits.view(-1, num_class), labels.view(-1))
             return loss
         else:
             return logits, attn_weights
@@ -285,6 +340,13 @@ class VisionTransformer(nn.Module):
             if self.zero_head:
                 nn.init.zeros_(self.head.weight)
                 nn.init.zeros_(self.head.bias)
+                # if self.multi_head:
+                #     for i in range(self.num_tasks):
+                #         nn.init.zeros_(self.head[i].weight)
+                #         nn.init.zeros_(self.head[i].bias)
+                # else:
+                #     nn.init.zeros_(self.head.weight)
+                #     nn.init.zeros_(self.head.bias)
             else:
                 self.head.weight.copy_(np2th(weights["head/kernel"]).t())
                 self.head.bias.copy_(np2th(weights["head/bias"]).t())
@@ -334,14 +396,3 @@ class VisionTransformer(nn.Module):
                 for bname, block in self.transformer.embeddings.hybrid_model.body.named_children():
                     for uname, unit in block.named_children():
                         unit.load_from(weights, n_block=bname, n_unit=uname)
-
-
-CONFIGS = {
-    'ViT-B_16': configs.get_b16_config(),
-    'ViT-B_32': configs.get_b32_config(),
-    'ViT-L_16': configs.get_l16_config(),
-    'ViT-L_32': configs.get_l32_config(),
-    'ViT-H_14': configs.get_h14_config(),
-    'R50-ViT-B_16': configs.get_r50_b16_config(),
-    'testing': configs.get_testing(),
-}

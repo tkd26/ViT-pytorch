@@ -20,6 +20,7 @@ from scipy import ndimage
 import models.configs as configs
 
 from .modeling_resnet import ResNetV2
+from .layers_PB import ElementWiseLinear
 
 
 logger = logging.getLogger(__name__)
@@ -33,7 +34,6 @@ FC_0 = "MlpBlock_3/Dense_0"
 FC_1 = "MlpBlock_3/Dense_1"
 ATTENTION_NORM = "LayerNorm_0"
 MLP_NORM = "LayerNorm_2"
-
 
 def np2th(weights, conv=False):
     """Possibly convert HWIO to OIHW."""
@@ -57,25 +57,31 @@ class Attention(nn.Module):
         self.attention_head_size = int(config.hidden_size / self.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
-        self.query = Linear(config.hidden_size, self.all_head_size)
-        self.key = Linear(config.hidden_size, self.all_head_size)
-        self.value = Linear(config.hidden_size, self.all_head_size)
+        # self.query = Linear(config.hidden_size, self.all_head_size)
+        # self.key = Linear(config.hidden_size, self.all_head_size)
+        # self.value = Linear(config.hidden_size, self.all_head_size)
 
-        self.out = Linear(config.hidden_size, config.hidden_size)
+        # self.out = Linear(config.hidden_size, config.hidden_size)
         self.attn_dropout = Dropout(config.transformer["attention_dropout_rate"])
         self.proj_dropout = Dropout(config.transformer["attention_dropout_rate"])
 
         self.softmax = Softmax(dim=-1)
+
+        self.query = ElementWiseLinear(config.hidden_size, self.all_head_size, config)
+        self.key = ElementWiseLinear(config.hidden_size, self.all_head_size, config)
+        self.value = ElementWiseLinear(config.hidden_size, self.all_head_size, config)
+        self.out = ElementWiseLinear(config.hidden_size, config.hidden_size, config)
 
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3)
 
-    def forward(self, hidden_states):
-        mixed_query_layer = self.query(hidden_states)
-        mixed_key_layer = self.key(hidden_states)
-        mixed_value_layer = self.value(hidden_states)
+    def forward(self, hidden_states, task):
+
+        mixed_query_layer = self.query(hidden_states, task)
+        mixed_key_layer = self.key(hidden_states, task)
+        mixed_value_layer = self.value(hidden_states, task)
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
         key_layer = self.transpose_for_scores(mixed_key_layer)
@@ -91,7 +97,7 @@ class Attention(nn.Module):
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(*new_context_layer_shape)
-        attention_output = self.out(context_layer)
+        attention_output = self.out(context_layer, task)
         attention_output = self.proj_dropout(attention_output)
         return attention_output, weights
 
@@ -99,10 +105,13 @@ class Attention(nn.Module):
 class Mlp(nn.Module):
     def __init__(self, config):
         super(Mlp, self).__init__()
-        self.fc1 = Linear(config.hidden_size, config.transformer["mlp_dim"])
-        self.fc2 = Linear(config.transformer["mlp_dim"], config.hidden_size)
+        # self.fc1 = Linear(config.hidden_size, config.transformer["mlp_dim"])
+        # self.fc2 = Linear(config.transformer["mlp_dim"], config.hidden_size)
         self.act_fn = ACT2FN["gelu"]
         self.dropout = Dropout(config.transformer["dropout_rate"])
+
+        self.fc1 = ElementWiseLinear(config.hidden_size, config.transformer["mlp_dim"], config)
+        self.fc2 = ElementWiseLinear(config.transformer["mlp_dim"], config.hidden_size, config)
 
         self._init_weights()
 
@@ -112,11 +121,11 @@ class Mlp(nn.Module):
         nn.init.normal_(self.fc1.bias, std=1e-6)
         nn.init.normal_(self.fc2.bias, std=1e-6)
 
-    def forward(self, x):
-        x = self.fc1(x)
+    def forward(self, x, task):
+        x = self.fc1(x, task)
         x = self.act_fn(x)
         x = self.dropout(x)
-        x = self.fc2(x)
+        x = self.fc2(x, task)
         x = self.dropout(x)
         return x
 
@@ -177,15 +186,15 @@ class Block(nn.Module):
         self.ffn = Mlp(config)
         self.attn = Attention(config, vis)
 
-    def forward(self, x):
+    def forward(self, x, task):
         h = x
         x = self.attention_norm(x)
-        x, weights = self.attn(x)
+        x, weights = self.attn(x, task)
         x = x + h
 
         h = x
         x = self.ffn_norm(x)
-        x = self.ffn(x)
+        x = self.ffn(x, task)
         x = x + h
         return x, weights
 
@@ -233,14 +242,16 @@ class Encoder(nn.Module):
         self.vis = vis
         self.layer = nn.ModuleList()
         self.encoder_norm = LayerNorm(config.hidden_size, eps=1e-6)
-        for _ in range(config.transformer["num_layers"]):
-            layer = Block(config, vis)
-            self.layer.append(copy.deepcopy(layer))
 
-    def forward(self, hidden_states):
+        for _ in range(config.transformer["num_layers"]):
+            # layer = Block(config, vis)
+            # self.layer.append(copy.deepcopy(layer))
+            self.layer.append(Block(config, vis))
+
+    def forward(self, hidden_states, task):
         attn_weights = []
         for layer_block in self.layer:
-            hidden_states, weights = layer_block(hidden_states)
+            hidden_states, weights = layer_block(hidden_states, task)
             if self.vis:
                 attn_weights.append(weights)
         encoded = self.encoder_norm(hidden_states)
@@ -253,9 +264,9 @@ class Transformer(nn.Module):
         self.embeddings = Embeddings(config, img_size=img_size)
         self.encoder = Encoder(config, vis)
 
-    def forward(self, input_ids):
+    def forward(self, input_ids, task):
         embedding_output = self.embeddings(input_ids)
-        encoded, attn_weights = self.encoder(embedding_output)
+        encoded, attn_weights = self.encoder(embedding_output, task)
         return encoded, attn_weights
 
 
@@ -263,19 +274,32 @@ class VisionTransformer(nn.Module):
     def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
+        self.num_tasks = len(num_classes)
         self.zero_head = zero_head
         self.classifier = config.classifier
+        self.multi_head = config.multi_head
 
         self.transformer = Transformer(config, img_size, vis)
-        self.head = Linear(config.hidden_size, num_classes)
+        if self.multi_head:
+            self.head = nn.ModuleList([Linear(config.hidden_size, num_class) for num_class in num_classes])
+        else:
+            self.head = Linear(config.hidden_size, num_classes)
 
     def forward(self, x, labels=None, task=None):
-        x, attn_weights = self.transformer(x)
-        logits = self.head(x[:, 0])
+        x, attn_weights = self.transformer(x, task)
+        if self.multi_head:
+            logits = self.head[task](x[:, 0])
+        else:
+            logits = self.head(x[:, 0])
+
+        if type(self.num_classes) == list:
+            num_class = self.num_classes[task]
+        else:
+            num_class = self.num_classes
 
         if labels is not None:
             loss_fct = CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, self.num_classes), labels.view(-1))
+            loss = loss_fct(logits.view(-1, num_class), labels.view(-1))
             return loss
         else:
             return logits, attn_weights
@@ -283,8 +307,15 @@ class VisionTransformer(nn.Module):
     def load_from(self, weights):
         with torch.no_grad():
             if self.zero_head:
-                nn.init.zeros_(self.head.weight)
-                nn.init.zeros_(self.head.bias)
+                # nn.init.zeros_(self.head.weight)
+                # nn.init.zeros_(self.head.bias)
+                if self.multi_head:
+                    for i in range(self.num_tasks):
+                        nn.init.zeros_(self.head[i].weight)
+                        nn.init.zeros_(self.head[i].bias)
+                else:
+                    nn.init.zeros_(self.head.weight)
+                    nn.init.zeros_(self.head.bias)
             else:
                 self.head.weight.copy_(np2th(weights["head/kernel"]).t())
                 self.head.bias.copy_(np2th(weights["head/bias"]).t())
@@ -338,6 +369,11 @@ class VisionTransformer(nn.Module):
 
 CONFIGS = {
     'ViT-B_16': configs.get_b16_config(),
+    'ViT-B_16_MultiHead': configs.get_b16_MultiHead_config(),
+    'ViT-B_16_RKR': configs.get_b16_RKR_config(),
+    'ViT-B_16_RKRnoRG': configs.get_b16_RKRnoRG_config(),
+    'ViT-B_16_RKRnoSFG': configs.get_b16_RKRnoSFG_config(),
+    'ViT-B_16_RKRTSN': configs.get_b16_RKRTSN_config(),
     'ViT-B_32': configs.get_b32_config(),
     'ViT-L_16': configs.get_l16_config(),
     'ViT-L_32': configs.get_l32_config(),

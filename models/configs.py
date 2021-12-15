@@ -52,7 +52,7 @@ def get_b16_config():
     config.class_num = 10
     return config
 
-def get_b16_FC_config():
+def get_b16_MultiHead_config():
     """Returns the ViT-B/16 configuration."""
     config = ml_collections.ConfigDict()
     config.patches = ml_collections.ConfigDict({'size': (16, 16)})
@@ -71,6 +71,8 @@ def get_b16_FC_config():
     config.K = 2
     config.task_num = 10
     config.class_num = 10
+    config.lamb = 1.
+    config.rkr_scale = 1e-1
     return config
 
 def get_b16_RKR_config():
@@ -92,10 +94,11 @@ def get_b16_RKR_config():
     config.K = 2
     config.task_num = 10
     config.class_num = 10
+    config.lamb = 1.
     config.rkr_scale = 1e-1
     return config
 
-def get_b16_RKR3_2_config():
+def get_b16_RKRPBG_config():
     """Returns the ViT-B/16 configuration."""
     config = ml_collections.ConfigDict()
     config.patches = ml_collections.ConfigDict({'size': (16, 16)})
@@ -112,10 +115,66 @@ def get_b16_RKR3_2_config():
     config.SFG = True
     config.multi_head = True
     config.K = 2
-    config.task_num = 10
-    config.class_num = 10
     config.lamb = 0.5
     config.rkr_scale = 1e-1
+    return config
+
+def get_b16_RKRTSN_config():
+    """Returns the ViT-B/16 configuration."""
+    config = ml_collections.ConfigDict()
+    config.patches = ml_collections.ConfigDict({'size': (16, 16)})
+    config.hidden_size = 768
+    config.transformer = ml_collections.ConfigDict()
+    config.transformer.mlp_dim = 3072
+    config.transformer.num_heads = 12
+    config.transformer.num_layers = 12
+    config.transformer.attention_dropout_rate = 0.0
+    config.transformer.dropout_rate = 0.1
+    config.classifier = 'token'
+    config.representation_size = None
+    config.RG = True
+    config.SFG = False # テストのためにSFGは一旦Falseにする
+    config.multi_head = True
+    config.K = 2
+    config.lamb = 1.0 # distillの割合
+    config.rkr_scale = 1e-1
+    config.task_emb_d = 50
+    return config
+
+def get_b16_PB_config():
+    """Returns the ViT-B/16 configuration."""
+    config = ml_collections.ConfigDict()
+    config.patches = ml_collections.ConfigDict({'size': (16, 16)})
+    config.hidden_size = 768
+    config.transformer = ml_collections.ConfigDict()
+    config.transformer.mlp_dim = 3072
+    config.transformer.num_heads = 12
+    config.transformer.num_layers = 12
+    config.transformer.attention_dropout_rate = 0.0
+    config.transformer.dropout_rate = 0.1
+    config.classifier = 'token'
+    config.representation_size = None
+    config.multi_head = True
+    config.threshold_fn = 'binarizer'
+    config.mask_scale = 1e-2
+    config.mask_init = '1s'
+    return config
+
+def get_b16_PBG_config():
+    """Returns the ViT-B/16 configuration."""
+    config = ml_collections.ConfigDict()
+    config.patches = ml_collections.ConfigDict({'size': (16, 16)})
+    config.hidden_size = 768
+    config.transformer = ml_collections.ConfigDict()
+    config.transformer.mlp_dim = 3072
+    config.transformer.num_heads = 12
+    config.transformer.num_layers = 12
+    config.transformer.attention_dropout_rate = 0.0
+    config.transformer.dropout_rate = 0.1
+    config.classifier = 'token'
+    config.representation_size = None
+    config.multi_head = True
+    config.lamb = 0.5
     return config
 
 def get_b16_RKRnoRG_config():

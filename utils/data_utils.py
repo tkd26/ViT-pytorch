@@ -12,8 +12,6 @@ from torch.utils.data import DataLoader, RandomSampler, DistributedSampler, Sequ
 
 logger = logging.getLogger(__name__)
 
-
-
 def get_loader(args):
     if args.local_rank not in [-1, 0]:
         torch.distributed.barrier()
@@ -141,14 +139,15 @@ def get_loader_splitCifar100(args, split_num):
 
         trainset = Mydatasets(origin=trainset_origin, transform=train_transforms, class_id=class_id_list[i])
         testset = Mydatasets(origin=testset_origin, transform=test_transforms, class_id=class_id_list[i])
-        
-        trainset_list.append(trainset)
-        testset_list.append(testset)
 
-        # train_sampler = RandomSampler(trainset) if args.local_rank == -1 else DistributedSampler(trainset, rank=args.local_rank)
-        # test_sampler = SequentialSampler(testset)
-        train_sampler = DistributedSampler(trainset, rank=args.local_rank, num_replicas=args.world_size)
-        test_sampler = DistributedSampler(testset, rank=args.local_rank, shuffle=False, num_replicas=args.world_size)
+        if args.local_rank != -1:
+            train_sampler = DistributedSampler(
+                trainset, rank=args.local_rank, shuffle=True, num_replicas=args.world_size)
+            test_sampler = DistributedSampler(
+                testset, rank=args.local_rank, shuffle=False, num_replicas=args.world_size)
+        else:
+            train_sampler = RandomSampler(trainset)
+            test_sampler = SequentialSampler(testset)
 
         trainloader_list.append(
             DataLoader(
@@ -190,9 +189,7 @@ def get_loader_splitImagenet(args, split_num):
 
     class_id_list = []
     classes_list = []
-    trainset_list = []
     trainloader_list = []
-    testset_list = []
     testloader_list = []
     
     classes = [None] * 1000
@@ -200,27 +197,44 @@ def get_loader_splitImagenet(args, split_num):
     train_path = '/home/yanai-lab/takeda-m/space0/dataset/decathlon-1.0/data/imagenet12/space0/split_train/'
     test_path = '/home/yanai-lab/takeda-m/space0/dataset/decathlon-1.0/data/imagenet12/space0/split_val/'
 
-    # print('loading imagenet...')
-    # trainset = datasets.ImageFolder(train_path + '/train')
-    # print('loading imagenet...')
-    # testset = datasets.ImageFolder(test_path + '/val')
-    # print('loaded imagenet')
-
-    # trainset = imagefolder_to_datasets(trainset)
-    # testset = imagefolder_to_datasets(testset)
-
     class_id_list = torch.chunk(torch.Tensor([i for i in range(1000)]), split_num)
 
     for i in range(split_num):
         classes_list.append([classes[int(id)] for id in class_id_list[i]])
 
         train_root = train_path + str(i)
-        trainset_list.append(datasets.ImageFolder(root=train_root, transform=train_transforms))
-        trainloader_list.append(DataLoader(trainset_list[i], batch_size=args.train_batch_size, shuffle=True, num_workers=4, pin_memory=True))
-        
         test_root = test_path + str(i)
-        testset_list.append(datasets.ImageFolder(root=test_root, transform=test_transforms))
-        testloader_list.append(DataLoader(testset_list[i], batch_size=args.eval_batch_size, shuffle=False, num_workers=4, pin_memory=True))
+
+        trainset = datasets.ImageFolder(root=train_root, transform=train_transforms)
+        testset = datasets.ImageFolder(root=test_root, transform=test_transforms)
+
+        if args.local_rank != -1:
+            train_sampler = DistributedSampler(
+                trainset, rank=args.local_rank, shuffle=True, num_replicas=args.world_size)
+            test_sampler = DistributedSampler(
+                testset, rank=args.local_rank, shuffle=False, num_replicas=args.world_size)
+        else:
+            train_sampler = RandomSampler(trainset)
+            test_sampler = SequentialSampler(testset)
+
+        trainloader_list.append(
+            DataLoader(
+                trainset, 
+                batch_size=args.train_batch_size, 
+                # shuffle=True, 
+                sampler=train_sampler,
+                num_workers=4, 
+                pin_memory=True))
+                
+        testloader_list.append(
+            DataLoader(
+                testset, 
+                batch_size=args.eval_batch_size, 
+                # shuffle=False, 
+                sampler=test_sampler,
+                num_workers=4, 
+                pin_memory=True))
+        
         print('task{} dataset loaded'.format(i))
 
     return trainloader_list, testloader_list, classes_list

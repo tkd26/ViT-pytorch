@@ -34,6 +34,70 @@ FC_1 = "MlpBlock_3/Dense_1"
 ATTENTION_NORM = "LayerNorm_0"
 MLP_NORM = "LayerNorm_2"
 
+# K = 2
+TASK_NUM = 10
+# RG, SFG = True, True
+
+class TaskEmbedding(nn.Module):
+    def __init__(self, d, task_num):
+        super().__init__()
+
+        # 8層のfc
+        self.fc = nn.Sequential(
+            nn.Linear(d, d),
+            nn.Linear(d, d),
+            nn.Linear(d, d),
+            nn.Linear(d, d),
+            nn.Linear(d, d),
+            nn.Linear(d, d),
+            nn.Linear(d, d),
+            nn.Linear(d, task_num)
+        )
+
+    def forward(self, task_vec):
+        task_emb_vec = self.fc(task_vec)
+        return task_emb_vec
+
+class RG_FC(nn.Module):
+    def __init__(self, config, h_in, h_out):
+        super().__init__()
+
+        self.RG = config.RG
+        self.K = config.K
+        self.h_in = h_in
+        self.h_out = h_out
+
+        self.weight = nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(self.h_out, self.h_in)))
+
+        self.bias = nn.Parameter(nn.init.normal_(torch.Tensor(self.h_out)))
+
+        if self.RG:
+            self.LM_fc = nn.Linear(config.task_num, self.h_in * self.K)
+            self.RM_fc = nn.Linear(config.task_num, self.h_out * self.K)
+
+    def forward(self, x, task, task_emb_vec):
+        if self.RG:
+            LM = self.LM_fc(task_emb_vec).reshape(self.h_in, self.K)
+            RM = self.RM_fc(task_emb_vec).reshape(self.K, self.h_out)
+            R = torch.matmul(LM, RM)
+            R = R.permute(1, 0)
+            weight = R + self.weight
+        else:
+            weight = self.weight
+        return nn.functional.linear(x, weight, bias=self.bias)
+
+class SFG_FC(nn.Module):
+    def __init__(self, c_out, task_num: int):
+        super().__init__()
+        self.F_list = nn.ParameterList([nn.Parameter(torch.ones(c_out)) for _ in range(task_num)])
+        # self.F_list = nn.ParameterList([nn.Parameter(nn.init.normal_(torch.Tensor(c_out))) for _ in range(task_num)])
+    
+    def forward(self, x, task: int, task_emb_vec):
+        F = self.F_list[task]
+        F = F.unsqueeze(0).unsqueeze(0)
+        F = F.repeat(x.shape[0], x.shape[1], 1)
+        x = x * F
+        return x
 
 def np2th(weights, conv=False):
     """Possibly convert HWIO to OIHW."""
@@ -57,25 +121,44 @@ class Attention(nn.Module):
         self.attention_head_size = int(config.hidden_size / self.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
 
-        self.query = Linear(config.hidden_size, self.all_head_size)
-        self.key = Linear(config.hidden_size, self.all_head_size)
-        self.value = Linear(config.hidden_size, self.all_head_size)
+        # self.query = Linear(config.hidden_size, self.all_head_size)
+        # self.key = Linear(config.hidden_size, self.all_head_size)
+        # self.value = Linear(config.hidden_size, self.all_head_size)
 
-        self.out = Linear(config.hidden_size, config.hidden_size)
+        # self.out = Linear(config.hidden_size, config.hidden_size)
         self.attn_dropout = Dropout(config.transformer["attention_dropout_rate"])
         self.proj_dropout = Dropout(config.transformer["attention_dropout_rate"])
 
         self.softmax = Softmax(dim=-1)
+
+        self.RG, self.SFG = config.RG, config.SFG
+
+        self.query = RG_FC(config, config.hidden_size, self.all_head_size)
+        self.key = RG_FC(config, config.hidden_size, self.all_head_size)
+        self.value = RG_FC(config, config.hidden_size, self.all_head_size)
+        self.out = RG_FC(config, config.hidden_size, config.hidden_size)
+
+        if self.SFG:
+            self.SFG_query = SFG_FC(self.all_head_size, config.task_num)
+            self.SFG_key = SFG_FC(self.all_head_size, config.task_num)
+            self.SFG_value = SFG_FC(self.all_head_size, config.task_num)
+            self.SFG_out = SFG_FC(self.all_head_size, config.task_num)
 
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3)
 
-    def forward(self, hidden_states):
-        mixed_query_layer = self.query(hidden_states)
-        mixed_key_layer = self.key(hidden_states)
-        mixed_value_layer = self.value(hidden_states)
+    def forward(self, hidden_states, task, task_emb_vec):
+
+        mixed_query_layer = self.query(hidden_states, task, task_emb_vec)
+        mixed_key_layer = self.key(hidden_states, task, task_emb_vec)
+        mixed_value_layer = self.value(hidden_states, task, task_emb_vec)
+
+        if self.SFG:
+            mixed_query_layer = self.SFG_query(mixed_query_layer, task, task_emb_vec)
+            mixed_key_layer = self.SFG_key(mixed_key_layer, task, task_emb_vec)
+            mixed_value_layer = self.SFG_value(mixed_value_layer, task, task_emb_vec)
 
         query_layer = self.transpose_for_scores(mixed_query_layer)
         key_layer = self.transpose_for_scores(mixed_key_layer)
@@ -91,7 +174,9 @@ class Attention(nn.Module):
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
         new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(*new_context_layer_shape)
-        attention_output = self.out(context_layer)
+        attention_output = self.out(context_layer, task, task_emb_vec)
+        if self.SFG:
+            attention_output = self.SFG_out(attention_output, task, task_emb_vec)
         attention_output = self.proj_dropout(attention_output)
         return attention_output, weights
 
@@ -99,12 +184,21 @@ class Attention(nn.Module):
 class Mlp(nn.Module):
     def __init__(self, config):
         super(Mlp, self).__init__()
-        self.fc1 = Linear(config.hidden_size, config.transformer["mlp_dim"])
-        self.fc2 = Linear(config.transformer["mlp_dim"], config.hidden_size)
+        # self.fc1 = Linear(config.hidden_size, config.transformer["mlp_dim"])
+        # self.fc2 = Linear(config.transformer["mlp_dim"], config.hidden_size)
         self.act_fn = ACT2FN["gelu"]
         self.dropout = Dropout(config.transformer["dropout_rate"])
 
+        self.RG, self.SFG = config.RG, config.SFG
+
+        self.fc1 = RG_FC(config, config.hidden_size, config.transformer["mlp_dim"])
+        self.fc2 = RG_FC(config, config.transformer["mlp_dim"], config.hidden_size)
+
         self._init_weights()
+
+        if self.SFG:
+            self.SFG1 = SFG_FC(config.transformer["mlp_dim"], config.task_num)
+            self.SFG2 = SFG_FC(config.hidden_size, config.task_num)
 
     def _init_weights(self):
         nn.init.xavier_uniform_(self.fc1.weight)
@@ -112,11 +206,15 @@ class Mlp(nn.Module):
         nn.init.normal_(self.fc1.bias, std=1e-6)
         nn.init.normal_(self.fc2.bias, std=1e-6)
 
-    def forward(self, x):
-        x = self.fc1(x)
+    def forward(self, x, task, task_emb_vec):
+        x = self.fc1(x, task, task_emb_vec)
+        if self.SFG:
+            x = self.SFG1(x, task, task_emb_vec)
         x = self.act_fn(x)
         x = self.dropout(x)
-        x = self.fc2(x)
+        x = self.fc2(x, task, task_emb_vec)
+        if self.SFG:
+            x = self.SFG2(x, task, task_emb_vec)
         x = self.dropout(x)
         return x
 
@@ -177,15 +275,15 @@ class Block(nn.Module):
         self.ffn = Mlp(config)
         self.attn = Attention(config, vis)
 
-    def forward(self, x):
+    def forward(self, x, task, task_emb_vec):
         h = x
         x = self.attention_norm(x)
-        x, weights = self.attn(x)
+        x, weights = self.attn(x, task, task_emb_vec)
         x = x + h
 
         h = x
         x = self.ffn_norm(x)
-        x = self.ffn(x)
+        x = self.ffn(x, task, task_emb_vec)
         x = x + h
         return x, weights
 
@@ -237,10 +335,10 @@ class Encoder(nn.Module):
             layer = Block(config, vis)
             self.layer.append(copy.deepcopy(layer))
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, task, task_emb_vec):
         attn_weights = []
         for layer_block in self.layer:
-            hidden_states, weights = layer_block(hidden_states)
+            hidden_states, weights = layer_block(hidden_states, task, task_emb_vec)
             if self.vis:
                 attn_weights.append(weights)
         encoded = self.encoder_norm(hidden_states)
@@ -253,9 +351,9 @@ class Transformer(nn.Module):
         self.embeddings = Embeddings(config, img_size=img_size)
         self.encoder = Encoder(config, vis)
 
-    def forward(self, input_ids):
+    def forward(self, input_ids, task, task_emb_vec):
         embedding_output = self.embeddings(input_ids)
-        encoded, attn_weights = self.encoder(embedding_output)
+        encoded, attn_weights = self.encoder(embedding_output, task, task_emb_vec)
         return encoded, attn_weights
 
 
@@ -263,28 +361,63 @@ class VisionTransformer(nn.Module):
     def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
+        self.num_tasks = len(num_classes)
         self.zero_head = zero_head
         self.classifier = config.classifier
+        self.multi_head = config.multi_head
+
+        self.task_emb_labels = [None] * config.task_num
+        self.task_embedding = TaskEmbedding(d=config.task_emb_d, task_num=self.num_tasks)
 
         self.transformer = Transformer(config, img_size, vis)
-        self.head = Linear(config.hidden_size, num_classes)
+        if self.multi_head:
+            self.head = nn.ModuleList([Linear(config.hidden_size, num_class) for num_class in num_classes])
+        else:
+            self.head = Linear(config.hidden_size, num_classes)
 
-    def forward(self, x, labels=None, task=None):
-        x, attn_weights = self.transformer(x)
-        logits = self.head(x[:, 0])
+    def forward(self, x, labels=None, task=None, task_vecs=None):
+        task_emb_vecs = self.task_embedding(task_vecs)
+        task_emb_vec = task_emb_vecs[task] # 現在のタスクの埋め込みベクトルを取得
+
+        self.task_emb_labels[task] = task_emb_vec.detach() # 現在のタスクの埋め込みベクトルを保存する
+
+        x, attn_weights = self.transformer(x, task, task_emb_vec)
+        if self.multi_head:
+            logits = self.head[task](x[:, 0])
+        else:
+            logits = self.head(x[:, 0])
+
+        if type(self.num_classes) == list:
+            num_class = self.num_classes[task]
+        else:
+            num_class = self.num_classes
 
         if labels is not None:
             loss_fct = CrossEntropyLoss()
-            loss = loss_fct(logits.view(-1, self.num_classes), labels.view(-1))
-            return loss
+            loss = loss_fct(logits.view(-1, num_class), labels.view(-1))
+            if task != 0:
+                # 現在のタスクまでの出力を蒸留
+                loss_distill = torch.nn.L1Loss()(
+                    task_emb_vecs[:task + 1], torch.stack(self.task_emb_labels[:task + 1], dim=0))
+            else:
+                loss_distill = torch.tensor(0)
+            return loss, loss_distill
+            # return loss
         else:
             return logits, attn_weights
 
     def load_from(self, weights):
         with torch.no_grad():
             if self.zero_head:
-                nn.init.zeros_(self.head.weight)
-                nn.init.zeros_(self.head.bias)
+                # nn.init.zeros_(self.head.weight)
+                # nn.init.zeros_(self.head.bias)
+                if self.multi_head:
+                    for i in range(self.num_tasks):
+                        nn.init.zeros_(self.head[i].weight)
+                        nn.init.zeros_(self.head[i].bias)
+                else:
+                    nn.init.zeros_(self.head.weight)
+                    nn.init.zeros_(self.head.bias)
             else:
                 self.head.weight.copy_(np2th(weights["head/kernel"]).t())
                 self.head.bias.copy_(np2th(weights["head/bias"]).t())
@@ -338,6 +471,10 @@ class VisionTransformer(nn.Module):
 
 CONFIGS = {
     'ViT-B_16': configs.get_b16_config(),
+    'ViT-B_16_RKR': configs.get_b16_RKR_config(),
+    'ViT-B_16_RKRnoRG': configs.get_b16_RKRnoRG_config(),
+    'ViT-B_16_RKRnoSFG': configs.get_b16_RKRnoSFG_config(),
+    'ViT-B_16_RKRTSN': configs.get_b16_RKRTSN_config(),
     'ViT-B_32': configs.get_b32_config(),
     'ViT-L_16': configs.get_l16_config(),
     'ViT-L_32': configs.get_l32_config(),
