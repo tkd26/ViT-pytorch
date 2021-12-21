@@ -17,8 +17,6 @@ from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNo
 from torch.nn.modules.utils import _pair
 from scipy import ndimage
 
-import models.configs as configs
-
 from .modeling_resnet import ResNetV2
 from .layers_PB import ElementWiseLinear
 
@@ -365,19 +363,3 @@ class VisionTransformer(nn.Module):
                 for bname, block in self.transformer.embeddings.hybrid_model.body.named_children():
                     for uname, unit in block.named_children():
                         unit.load_from(weights, n_block=bname, n_unit=uname)
-
-
-CONFIGS = {
-    'ViT-B_16': configs.get_b16_config(),
-    'ViT-B_16_MultiHead': configs.get_b16_MultiHead_config(),
-    'ViT-B_16_RKR': configs.get_b16_RKR_config(),
-    'ViT-B_16_RKRnoRG': configs.get_b16_RKRnoRG_config(),
-    'ViT-B_16_RKRnoSFG': configs.get_b16_RKRnoSFG_config(),
-    'ViT-B_16_RKRTSN': configs.get_b16_RKRTSN_config(),
-    'ViT-B_32': configs.get_b32_config(),
-    'ViT-L_16': configs.get_l16_config(),
-    'ViT-L_32': configs.get_l32_config(),
-    'ViT-H_14': configs.get_h14_config(),
-    'R50-ViT-B_16': configs.get_r50_b16_config(),
-    'testing': configs.get_testing(),
-}

@@ -18,9 +18,9 @@ from torch.utils.tensorboard import SummaryWriter
 from apex import amp
 # from apex.parallel import DistributedDataParallel as DDP
 
-# from models.modeling import VisionTransformer, CONFIGS
-from models.modeling_RKR import VisionTransformer, CONFIGS
-from models.modeling_RKRTSN import VisionTransformer as VisionTransformer_RKRTSN, TaskEmbedding
+from models.config import get_config
+from models.ViT.modeling_RKR import VisionTransformer
+from models.ViT.modeling_RKRTSN import VisionTransformer as VisionTransformer_RKRTSN, TaskEmbedding
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
 from utils.data_utils import get_loader, get_loader_splitCifar100, get_loader_splitImagenet, get_VD_loader
 from utils.dist_util import get_world_size
@@ -68,7 +68,7 @@ def save_model(args, model, task):
 
 def setup(args):
     # Prepare model
-    config = CONFIGS[args.model_type]
+    config = get_config(args.model_type, args.dataset)
 
     if args.lamb != None:
         config.lamb = args.lamb
@@ -483,9 +483,10 @@ def main():
     # Training
     train(args, config, model)
 
+    if args.local_rank != -1:
+        # destrory all processes
+        dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     main()
-
-    # destrory all processes
-    dist.destroy_process_group()

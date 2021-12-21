@@ -11,16 +11,26 @@ import numpy as np
 from datetime import timedelta
 
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 
 from tqdm import tqdm
-from torch.utils.tensorboard import SummaryWriter
+# from torch.utils.tensorboard import SummaryWriter
 from apex import amp
 # from apex.parallel import DistributedDataParallel as DDP
 
-from models.modeling import VisionTransformer
-from models.modeling_RKR import VisionTransformer as VisionTransformer_RKR, CONFIGS
-from models.modeling_PB import VisionTransformer as VisionTransformer_PB
+from models.config import get_config
+
+from models.ResNet.resnet_RKR import resnet18 as ResNet18_RKR
+from models.ResNet.resnet_PB import resnet18 as ResNet18_PB
+
+from models.ViT.modeling import VisionTransformer
+from models.ViT.modeling_RKR import VisionTransformer as VisionTransformer_RKR
+from models.ViT.modeling_PB import VisionTransformer as VisionTransformer_PB
+
+from models.Swin.swin_RKR import SwinTransformer as SwinTransformer_RKR
+from models.Swin.swin_PB import SwinTransformer as SwinTransformer_PB
+
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
 from utils.data_utils import get_loader, get_loader_splitCifar100, get_loader_splitImagenet, get_VD_loader
 from utils.dist_util import get_world_size
@@ -30,6 +40,7 @@ from argparse import ArgumentParser
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+import torch.multiprocessing as mp
 
 logger = logging.getLogger(__name__)
 
@@ -65,10 +76,46 @@ def save_model(args, model, task):
     torch.save(model_to_save.state_dict(), model_checkpoint)
     logger.info("Saved model checkpoint to [DIR: %s]", args.output_dir)
 
+def model_initialization(args, model):
+    if 'ResNet' in args.model_type:
+        # 事前学習済モデルのロード
+        pre_model_dict = torch.load('/host/space0/takeda-m/jupyter/notebook/RKR/model/resnet34-b627a593.pth')
+        pre_model_keys = [k for k, v in pre_model_dict.items()]
+        new_model_dict = {}
+        for k, v in model.state_dict().items():
+            if k in pre_model_keys:
+                new_model_dict[k] = pre_model_dict[k]
+            else:
+                new_model_dict[k] = v
+        model.load_state_dict(new_model_dict)
 
-def setup(args, task=0):
+    elif 'ViT' in args.model_type:
+        model.load_from(np.load(args.pretrained_dir))
+
+    elif 'Swin' in args.model_type:
+        # 事前学習済モデルのロード
+        pre_model_dict = torch.load(args.pretrained_dir)['model']
+        del pre_model_dict['head.weight'], pre_model_dict['head.bias']
+        pre_model_keys = [k for k, v in pre_model_dict.items()]
+        new_model_dict = {}
+        for k, v in  model.state_dict().items():
+            if k in pre_model_keys:
+                if pre_model_dict[k].size() != model.state_dict()[k].size():
+                    print('load_pretrained: %s from %s to %s' % (k, pre_model_dict[k].size(), model.state_dict()[k].size()))
+                    new_model_dict[k] = nn.functional.interpolate(
+                        pre_model_dict[k].unsqueeze(0).unsqueeze(0).float(), 
+                        size=model.state_dict()[k].size()).squeeze(0).squeeze(0).long()
+                else:
+                    new_model_dict[k] = pre_model_dict[k]
+            else:
+                new_model_dict[k] = v
+        model.load_state_dict(new_model_dict)
+
+    return model
+
+def setup(args, task=0, rank=None):
     # Prepare model
-    config = CONFIGS[args.model_type] # modeling_RKR.pyのCONFIGS
+    config = get_config(args.model_type, args.dataset)
 
     if args.lamb != None:
         config.lamb = args.lamb
@@ -78,7 +125,7 @@ def setup(args, task=0):
 
     if args.K != None:
         config.K = args.K
-
+    
     if args.dataset == "cifar100":
         num_classes = [10] * 10
     elif args.dataset == "imagenet":
@@ -87,35 +134,50 @@ def setup(args, task=0):
         num_classes = [1000, 100, 100, 2, 47, 43, 1623, 10, 101, 102]
     config.task_num = len(num_classes)
 
-    if args.model_type == 'ViT-B_16':
-        model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes[task])
-    elif args.model_type == 'ViT-B_16_PB':
-        model = VisionTransformer_PB(config, args.img_size, zero_head=True, num_classes=num_classes)
-    else:
-        model = VisionTransformer_RKR(config, args.img_size, zero_head=True, num_classes=num_classes)
+    if 'ResNet' in args.model_type:
+        if args.model_type == 'ResNet18':
+            model = ResNet18_RKR(pretrained=False, num_classes=num_classes[task], config=config)
+        elif args.model_type == 'ResNet18_PB':
+            model = ResNet18_PB(pretrained=False, num_classes=num_classes, config=config)
+        else:
+            model = ResNet18_RKR(pretrained=False, num_classes=num_classes, config=config)
 
-    # print(model)
-    # print(list(np.load(args.pretrained_dir)))
-    # for name, param in model.named_parameters():
-    #     logger.info(name)
+    elif 'ViT' in args.model_type:
+        if args.model_type == 'ViT-B_16':
+            model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes[task])
+        elif args.model_type == 'ViT-B_16_PB':
+            model = VisionTransformer_PB(config, args.img_size, zero_head=True, num_classes=num_classes)
+        else:
+            model = VisionTransformer_RKR(config, args.img_size, zero_head=True, num_classes=num_classes)
 
-    model.load_from(np.load(args.pretrained_dir))
-    model.to(args.device)
-    num_params = count_parameters(model)
+    elif 'Swin' in args.model_type:
+        if args.model_type == 'Swin':
+            model = SwinTransformer_RKR(config, args.img_size, num_classes=num_classes[task])
+        elif args.model_type == 'Swin_PB':
+            model = SwinTransformer_PB(config, args.img_size, num_classes=num_classes)
+        else:
+            model = SwinTransformer_RKR(config, args.img_size, num_classes=num_classes)
+
+    model = model_initialization(args, model)
 
     # Distributed training
     if args.local_rank != -1:
+        model.to(rank)
         # DDP
         model = DDP(
                 model,
-                find_unused_parameters = True,
-                device_ids=[args.local_rank]
+                device_ids=[rank],
+                find_unused_parameters=True,
             )
+    else:
+        model.to(args.device)
+
+    num_params = count_parameters(model)
 
     logger.info("{}".format(config))
     logger.info("Training parameters %s", args)
     logger.info("Total Parameter: \t%2.1fM" % num_params)
-    if args.model_type == 'ViT-B_16_PB':
+    if args.model_type in ['ResNet18_PB', 'ViT-B_16_PB', 'Swin_PB']:
         params, mask_params = count_parameters_PB(model)
         logger.info("Total Parameter: \t%2.1fM + \t%2.1fM = \t%2.1fM" % (params, mask_params, params + mask_params))
     return args, model, config
@@ -142,7 +204,7 @@ def set_seed(args):
     torch.backends.cudnn.benchmark = False
 
 
-def valid(args, model, test_loader, global_step, task):
+def valid(args, model, test_loader, global_step, task, rank=None):
     # Validation!
     eval_losses = AverageMeter()
 
@@ -158,7 +220,12 @@ def valid(args, model, test_loader, global_step, task):
                           )
     loss_fct = torch.nn.CrossEntropyLoss()
     for step, batch in enumerate(epoch_iterator):
-        batch = tuple(t.to(args.device) for t in batch)
+        if args.local_rank != -1:
+            batch = tuple(t.to(rank) for t in batch)
+            # batch = tuple(t.to(args.device) for t in batch)
+        else:
+            batch = tuple(t.to(args.device) for t in batch)
+
         x, y = batch
         with torch.no_grad():
             logits = model(x, task=task)[0]
@@ -185,7 +252,9 @@ def valid(args, model, test_loader, global_step, task):
 
     # 他のノードから集める
     if args.local_rank != -1:
-        dist.all_reduce(torch.tensor(accuracy).to(args.device), op=dist.ReduceOp.SUM)
+        dist.all_reduce(torch.tensor(accuracy).to(rank), op=dist.ReduceOp.SUM)
+        # dist.all_reduce(torch.tensor(accuracy).to(dist.get_rank()), op=dist.ReduceOp.SUM)
+        dist.barrier()
     print("\n")
     logger.info("Task%d Validation Results" % task)
     logger.info("Global Steps: %d" % global_step)
@@ -196,33 +265,29 @@ def valid(args, model, test_loader, global_step, task):
     return accuracy
 
 
-def train(args, model, config):
+def train(args, model, config, rank=None):
     """ Train the model """
-    # if args.local_rank in [-1, 0]:
-    #     os.makedirs(args.output_dir, exist_ok=True)
-    #     writer = SummaryWriter(log_dir=os.path.join("logs", args.name))
-
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
     # Prepare dataset
     # train_loader, test_loader = get_loader(args)
     if args.dataset == 'cifar100':
-        train_loader_list, test_loader_list, classes_list  = get_loader_splitCifar100(args, split_num = 10)
+        train_loader_list, test_loader_list, classes_list  = get_loader_splitCifar100(args, split_num=10, rank=rank)
     elif args.dataset == 'imagenet':
-        train_loader_list, test_loader_list, classes_list  = get_loader_splitImagenet(args, split_num = 10)
+        train_loader_list, test_loader_list, classes_list  = get_loader_splitImagenet(args, split_num=10)
     elif args.dataset == 'VD':
         train_loader_list, test_loader_list, classes_list  = get_VD_loader(args)
 
     for task in range(args.start_task, config.task_num):
 
-        if args.model_type == 'ViT-B_16' and task != 0:
-            args, model, _ = setup(args, task)
+        if args.model_type in ['ResNet18', 'ViT-B_16', 'Swin'] and task != 0:
+            args, model, _ = setup(args, task, rank=(None if args.local_rank == -1 else rank))
 
         train_loader = train_loader_list[task]
         test_loader = test_loader_list[task]
 
         # MultiHead2での設定
-        if args.model_type == 'ViT-B_16_MultiHead' and 'MultiHead2' in args.name: 
+        if 'MultiHead2' in args.name: 
             if task == 0:
                 for name, param in model.named_parameters():
                     param.requires_grad = True
@@ -235,8 +300,8 @@ def train(args, model, config):
                     if 'head' in name:
                         if name.split('.')[-2] == str(task):
                             param.requires_grad = True 
-
-        elif args.model_type == 'ViT-B_16_PB':
+        # PBでの設定
+        elif args.model_type in ['ResNet18_PB', 'ViT-B_16_PB', 'Swin_PB']:
             for name, param in model.named_parameters():
                 param.requires_grad = False
                 if 'mask_reals' in name:
@@ -245,8 +310,8 @@ def train(args, model, config):
                 if 'head' in name:
                     if name.split('.')[-2] == str(task):
                         param.requires_grad = True
-
-        elif args.model_type != 'ViT-B_16':
+        # それ以外のSingle以外
+        elif args.model_type not in ['ResNet18', 'ViT-B_16', 'Swin']:
             for name, param in model.named_parameters():
                 param.requires_grad = False
                 if 'F_list' in name:
@@ -268,11 +333,6 @@ def train(args, model, config):
                                     lr=args.learning_rate,
                                     momentum=0.9,
                                     weight_decay=args.weight_decay)
-
-        # optimizer_masks = optim.Adam(
-        #     model.shared.parameters(), lr=args.lr_mask)
-        # optimizer_classifier = optim.Adam(
-        #     model.classifier.parameters(), lr=args.lr_classifier)
         
         t_total = args.num_steps
         if args.decay_type == "cosine":
@@ -307,8 +367,12 @@ def train(args, model, config):
                                 dynamic_ncols=True,
                                 # disable=args.local_rank not in [-1, 0]
                                 )
-            for step, batch in enumerate(epoch_iterator):
-                batch = tuple(t.to(args.device) for t in batch)
+            for step, batch in enumerate(epoch_iterator):     
+                if args.local_rank != -1:
+                    batch = tuple(t.to(rank) for t in batch)
+                else:
+                    batch = tuple(t.to(args.device) for t in batch)
+
                 x, y = batch
                 loss = model(x, y, task)
 
@@ -334,19 +398,14 @@ def train(args, model, config):
                     epoch_iterator.set_description(
                         "Training%d (%d / %d Steps) (loss=%2.5f)" % (task, global_step, t_total, losses.val)
                     )
-                    # if args.local_rank in [-1, 0]:
-                    #     writer.add_scalar("train/loss{}".format(task), scalar_value=losses.val, global_step=global_step)
-                    #     writer.add_scalar("train/lr{}".format(task), scalar_value=scheduler.get_lr()[0], global_step=global_step)
                     if global_step % args.eval_every == 0:
                     # if global_step % args.eval_every == 0 and args.local_rank in [-1, 0]:
-                        accuracy = valid(args, model, test_loader, global_step, task)
+                        accuracy = valid(args, model, test_loader, global_step, task, rank)
                         if best_acc < accuracy:
                             # save_model(args, model, task)
                             best_acc = accuracy
                         model.train()
 
-                    if args.local_rank != -1:
-                        dist.barrier()
                     if global_step % t_total == 0:
                         break
 
@@ -356,10 +415,13 @@ def train(args, model, config):
 
         # DDP
         if args.local_rank != -1:
-            dist.all_reduce(torch.tensor(best_acc).to(args.device), op=dist.ReduceOp.SUM)
+            dist.all_reduce(torch.tensor(best_acc).to(rank), op=dist.ReduceOp.SUM)
 
         logger.info("Task%d Best Accuracy: \t%f" % (task, best_acc))
         logger.info("End Training!")
+
+        if args.model_type in ['ResNet18', 'ViT-B_16', 'Swin']:
+            del model
 
     # if args.local_rank in [-1, 0]:
     #     writer.close()
@@ -373,10 +435,10 @@ def main():
     parser.add_argument("--dataset", choices=["cifar10", "cifar100", "imagenet", 'VD'], default="cifar10",
                         help="Which downstream task.")
     parser.add_argument("--model_type", choices=[
-        "ViT-B_16", "ViT-B_16_MultiHead", 
-        "ViT-B_16_RKR", "ViT-B_16_RKRnoRG", "ViT-B_16_RKRnoSFG",
-        "ViT-B_16_PB",
-        "ViT-B_32", "ViT-L_16", "ViT-L_32", "ViT-H_14", "R50-ViT-B_16"],
+        "ResNet18", "ResNet18_MultiHead", "ResNet18_RKR", "ResNet18_RKRwoRG", "ResNet18_RKRwoSFG", "ResNet18_PB",
+        "ViT-B_16", "ViT-B_16_MultiHead", "ViT-B_16_RKR", "ViT-B_16_RKRwoRG", "ViT-B_16_RKRwoSFG", "ViT-B_16_PB",
+        "Swin", "Swin_MultiHead", "Swin_RKR", 'Swin_PB',
+        ],
                         default="ViT-B_16",
                         help="Which variant to use.")
     parser.add_argument("--pretrained_dir", type=str, default="checkpoint/ViT-B_16.npz",
@@ -431,56 +493,68 @@ def main():
                              "Positive power of 2: static loss scaling value.\n")
     args = parser.parse_args()
 
-    # Set seed
+    # Set seed  
     set_seed(args)
-
-    if args.gpu_id != None:
-        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
-
-    # DDP
-    args.world_size = args.n_gpu = torch.cuda.device_count()
-    args.is_master = args.local_rank == 0
-    if args.local_rank != -1:
-        torch.cuda.set_device(args.local_rank)  
-        dist.init_process_group(backend='nccl', init_method='env://')
-
-    #handler2を作成
-    handler = logging.FileHandler(filename="./logfile/{}.log".format(args.name))  #handler2はファイル出力
-    handler.setLevel(logging.INFO)
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)8s %(message)s"))
-
-    #loggerにハンドラを設定
-    logger.addHandler(handler)
-
-    # Setup CUDA, GPU & distributed training
-    # if args.local_rank == -1:
-    #     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    #     args.n_gpu = torch.cuda.device_count()
-    # else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
-    #     torch.cuda.set_device(args.local_rank)
-    #     device = torch.device("cuda", args.local_rank)
-    #     torch.distributed.init_process_group(backend='nccl',
-    #                                          timeout=timedelta(minutes=60))
-    #     args.n_gpu = torch.cuda.device_count()
 
     args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # parallelしない時
+    if args.gpu_id != None:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
+    
+    # DDP
+    args.world_size = args.n_gpu = torch.cuda.device_count()
+    args.is_master = args.local_rank == 0
+
+    if args.local_rank != -1:
+        if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+            rank = int(os.environ["RANK"])
+            args.world_size = int(os.environ['WORLD_SIZE'])
+            print(f"RANK and WORLD_SIZE in environ: {rank}/{args.world_size}")
+        else:
+            print('The environment variable "RANK" or "WORLD_SIZE" does not exist.')
+            sys.exit(1)
+        
+        dist.init_process_group(backend='nccl', init_method='env://', world_size=args.world_size, rank=rank)
+
+
+    # ファイル出力するhandlerを設定
+    if args.local_rank == -1 or (args.local_rank != -1 and rank == 0):
+        if 'ResNet' in args.model_type:
+            dir_model = 'ResNet'
+        elif 'ViT' in args.model_type:
+            dir_model = 'ViT'
+        elif 'Swin' in args.model_type:
+            dir_model = 'Swin'
+
+        handler = logging.FileHandler(filename="./logfile/{}/{}.log".format(dir_model, args.name))
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)8s %(message)s"))
+        logger.addHandler(handler)
+
     # Setup logging
-    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
-                        datefmt='%m/%d/%Y %H:%M:%S',
-                        level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
+    if args.local_rank != -1:
+        logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+                            datefmt='%m/%d/%Y %H:%M:%S',
+                            level=logging.INFO if rank == 0 else logging.WARN)
+    else:
+        logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+                            datefmt='%m/%d/%Y %H:%M:%S',
+                            level=logging.INFO)
+
     logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s" %
                    (args.local_rank, args.device, args.n_gpu, bool(args.local_rank != -1), args.fp16))
 
     # Model & Tokenizer Setup
-    args, model, config = setup(args)
-
+    args, model, config = setup(args, rank=(None if args.local_rank == -1 else rank))
+    
     # Training
-    train(args, model, config)
+    train(args, model, config, rank=(None if args.local_rank == -1 else rank))
+    
 
+    if args.local_rank != -1:
+        # destrory all processes
+        dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()
-
-    # destrory all processes
-    dist.destroy_process_group()

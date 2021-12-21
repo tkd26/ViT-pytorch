@@ -86,7 +86,7 @@ class Mydatasets(torch.utils.data.Dataset):
 
         return out_data, out_label
 
-def get_loader_splitCifar100(args, split_num):
+def get_loader_splitCifar100(args, split_num, rank=None):
 
     normalize = transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
                                      
@@ -141,10 +141,12 @@ def get_loader_splitCifar100(args, split_num):
         testset = Mydatasets(origin=testset_origin, transform=test_transforms, class_id=class_id_list[i])
 
         if args.local_rank != -1:
-            train_sampler = DistributedSampler(
-                trainset, rank=args.local_rank, shuffle=True, num_replicas=args.world_size)
-            test_sampler = DistributedSampler(
-                testset, rank=args.local_rank, shuffle=False, num_replicas=args.world_size)
+            # train_sampler = DistributedSampler(
+            #     trainset, rank=args.local_rank, shuffle=True, num_replicas=args.world_size)
+            # test_sampler = DistributedSampler(
+            #     testset, rank=args.local_rank, shuffle=False, num_replicas=args.world_size)
+            train_sampler = DistributedSampler(trainset, shuffle=True, rank=rank)
+            test_sampler = DistributedSampler(testset, shuffle=False, rank=rank)
         else:
             train_sampler = RandomSampler(trainset)
             test_sampler = SequentialSampler(testset)

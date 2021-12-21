@@ -11,14 +11,12 @@ from os.path import join as pjoin
 
 import torch
 import torch.nn as nn
+from torch.nn import init
 import numpy as np
-import math
 
 from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNorm
 from torch.nn.modules.utils import _pair
 from scipy import ndimage
-
-import models.configs as configs
 
 from .modeling_resnet import ResNetV2
 
@@ -51,12 +49,15 @@ class PiggybackFC(nn.Module):
         self.lamb_rem_num = out_channels - self.lamb_num
 
         if self.task == 0:
-            self.unc_filt = nn.Parameter(torch.Tensor(self.out_channels, self.in_channels))
+            self.unc_filt = nn.Parameter(
+                init.normal_(torch.Tensor(self.out_channels, self.in_channels), 0.0, 0.02))
         else: 
             # after training, save unc_filt and weight_mat into files, so that u can use it now. 
             
-            self.unc_filt = nn.Parameter(torch.Tensor(self.lamb_num, self.in_channels)) 
-            self.weights_mat = nn.Parameter(torch.Tensor((self.out_channels + (self.task-1)*self.lamb_num), self.lamb_rem_num))
+            self.unc_filt = nn.Parameter(
+                init.normal_(torch.Tensor(self.lamb_num, self.in_channels), 0.0, 0.02))
+            self.weights_mat = nn.Parameter(
+                init.normal_(torch.Tensor((self.out_channels + (self.task-1)*self.lamb_num), self.lamb_rem_num), 0.0, 0.02))
             # self.register_buffer('concat_unc_filter', torch.cat(unc_filt_list, dim=0))
             self.register_buffer('concat_unc_filter', torch.Tensor(self.out_channels + (self.task - 1) * self.lamb_num, self.in_channels))
 
@@ -156,8 +157,8 @@ class Mlp(nn.Module):
     def _init_weights(self):
         nn.init.xavier_uniform_(self.fc1.unc_filt)
         nn.init.xavier_uniform_(self.fc2.unc_filt)
-        nn.init.normal_(self.fc1.bias, std=1e-6)
-        nn.init.normal_(self.fc2.bias, std=1e-6)
+        # nn.init.normal_(self.fc1.bias, std=1e-6)
+        # nn.init.normal_(self.fc2.bias, std=1e-6)
 
     def forward(self, x, task):
         x = self.fc1(x, task)
@@ -311,13 +312,13 @@ class VisionTransformer(nn.Module):
         super(VisionTransformer, self).__init__()
 
         self.num_classes = num_classes
-        self.num_tasks = len(num_classes)
+        # self.num_tasks = len(num_classes)
         self.zero_head = zero_head
         self.classifier = config.classifier
         self.multi_head = config.multi_head
 
         self.transformer = Transformer(config, img_size, vis, task)
-        self.head = Linear(config.hidden_size, num_classes[task])
+        self.head = Linear(config.hidden_size, num_classes)
 
     def forward(self, x, labels=None, task=None):
         x, attn_weights = self.transformer(x, task)

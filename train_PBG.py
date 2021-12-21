@@ -14,14 +14,19 @@ import torch
 import torch.distributed as dist
 
 from tqdm import tqdm
-from torch.utils.tensorboard import SummaryWriter
+# from torch.utils.tensorboard import SummaryWriter
 from apex import amp
 # from apex.parallel import DistributedDataParallel as DDP
 
-# from models.modeling import VisionTransformer, CONFIGS
-from models.modeling_RKR import VisionTransformer, CONFIGS
-from models.modeling_RKRPBG import VisionTransformer as VisionTransformer_RKRPBG
-from models.modeling_PBG import VisionTransformer as VisionTransformer_PBG
+from models.config import get_config
+
+from models.ResNet.resnet_PBG import resnet18 as ResNet18_PBG, PiggybackConv
+
+from models.ViT.modeling_RKRPBG import VisionTransformer as VisionTransformer_RKRPBG
+from models.ViT.modeling_PBG import VisionTransformer as VisionTransformer_PBG, PiggybackFC
+
+from models.Swin.swin_PBG import SwinTransformer as SwinTransformer_PBG
+
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
 from utils.data_utils import get_loader, get_loader_splitCifar100, get_loader_splitImagenet, get_VD_loader
 from utils.dist_util import get_world_size
@@ -67,9 +72,9 @@ def save_model(args, model, task):
     logger.info("Saved model checkpoint to [DIR: %s]", args.output_dir)
 
 
-def setup(args, task, all_task_specific_param):
+def setup(args, task, rank, all_task_specific_param):
     # Prepare model
-    config = CONFIGS[args.model_type] # modeling_RKR.pyのCONFIGS
+    config = get_config(args.model_type, args.dataset)
 
     if args.lamb != None:
         config.lamb = args.lamb
@@ -86,28 +91,49 @@ def setup(args, task, all_task_specific_param):
 
     config.task_num = len(num_classes)
 
-    # model = VisionTransformer_RKR3_2(config, args.img_size, zero_head=True, num_classes=num_classes)
-    if args.model_type == 'ViT-B_16_RKRPBG':
-        model = VisionTransformer_RKRPBG(config, args.img_size, zero_head=True, num_classes=num_classes, task=task)
-        model.load_from(np.load(args.pretrained_dir))
-    elif args.model_type == 'ViT-B_16_PBG':
-        model = VisionTransformer_PBG(config, args.img_size, zero_head=True, num_classes=num_classes, task=task)
+    if 'ResNet' in args.model_type:
+        if args.model_type == 'ResNet18_PBG':
+            model = ResNet18_PBG(pretrained=False, num_classes=num_classes[task], config=config, task=task)
+        
         if task == 0:
-            model.load_from(np.load(args.pretrained_dir))
+            # 事前学習済モデルのロード
+            pre_model_dict = torch.load('/host/space0/takeda-m/jupyter/notebook/RKR/model/resnet34-b627a593.pth')
+            pre_model_keys = [k for k, v in pre_model_dict.items()]
+            new_model_dict = {}
+            for k, v in model.state_dict().items():
+                if k in pre_model_keys:
+                    new_model_dict[k] = pre_model_dict[k]
+                else:
+                    new_model_dict[k] = v
+            model.load_state_dict(new_model_dict)
 
-    model.to(args.device)
-    num_params = count_parameters(model)
-    global_param, task_specific_param = count_task_parameters(model)
-    all_task_specific_param += task_specific_param
+    elif 'ViT' in args.model_type:
+        if args.model_type == 'ViT-B_16_RKRPBG':
+            model = VisionTransformer_RKRPBG(config, args.img_size, zero_head=True, num_classes=num_classes, task=task)
+            model.load_from(np.load(args.pretrained_dir))
+        elif args.model_type == 'ViT-B_16_PBG':
+            model = VisionTransformer_PBG(config, args.img_size, zero_head=True, num_classes=num_classes[task], task=task)
+            if task == 0:
+                model.load_from(np.load(args.pretrained_dir))
+    elif 'Swin' in args.model_type:
+        if args.model_type == 'Swin_PBG':
+            model = SwinTransformer_PBG(config, args.img_size, num_classes=num_classes[task], task=task)
 
     # Distributed training
     if args.local_rank != -1:
+        model.to(rank)
         # DDP
         model = DDP(
                 model,
-                find_unused_parameters = True,
-                device_ids=[args.local_rank]
+                device_ids=[rank],
+                find_unused_parameters=True,
             )
+    else:
+        model.to(args.device)
+
+    num_params = count_parameters(model)
+    global_param, task_specific_param = count_task_parameters(model)
+    all_task_specific_param += task_specific_param
 
     logger.info("{}".format(config))
     logger.info("Training parameters %s", args)
@@ -133,7 +159,7 @@ def count_task_parameters(model):
             task_specific_params.append(param.numel())
         elif 'weights_mat' in name:
             task_specific_params.append(param.numel())
-        elif 'unc_filt' in name and name != 'concat_unc_filter' and name != 'SFG_concat_unc_filter':
+        elif 'unc_filt' in name and name not in ['concat_unc_filter', 'SFG_concat_unc_filter']:
             task_specific_params.append(param.numel())
         else:
             global_params.append(param.numel())
@@ -152,7 +178,7 @@ def set_seed(args):
     torch.backends.cudnn.benchmark = False
 
 
-def valid(args, model, test_loader, global_step, task):
+def valid(args, model, test_loader, global_step, task, rank):
     # Validation!
     eval_losses = AverageMeter()
 
@@ -168,7 +194,11 @@ def valid(args, model, test_loader, global_step, task):
                           )
     loss_fct = torch.nn.CrossEntropyLoss()
     for step, batch in enumerate(epoch_iterator):
-        batch = tuple(t.to(args.device) for t in batch)
+        if args.local_rank != -1:
+            batch = tuple(t.to(rank) for t in batch)
+            # batch = tuple(t.to(args.device) for t in batch)
+        else:
+            batch = tuple(t.to(args.device) for t in batch)
         x, y = batch
         with torch.no_grad():
             logits = model(x, task=task)[0]
@@ -195,7 +225,9 @@ def valid(args, model, test_loader, global_step, task):
 
     # 他のノードから集める
     if args.local_rank != -1:
-        dist.all_reduce(torch.tensor(accuracy).to(args.device), op=dist.ReduceOp.SUM)
+        dist.all_reduce(torch.tensor(accuracy).to(rank), op=dist.ReduceOp.SUM)
+        # dist.all_reduce(torch.tensor(accuracy).to(dist.get_rank()), op=dist.ReduceOp.SUM)
+        dist.barrier()
     print("\n")
     logger.info("Task%d Validation Results" % task)
     logger.info("Global Steps: %d" % global_step)
@@ -206,38 +238,36 @@ def valid(args, model, test_loader, global_step, task):
     return accuracy
 
 
-def train(args):
+def train(args, rank=None):
     """ Train the model """
-    # if args.local_rank in [-1, 0]:
-    #     os.makedirs(args.output_dir, exist_ok=True)
-    #     writer = SummaryWriter(log_dir=os.path.join("logs", args.name))
-
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
     # Prepare dataset
     # train_loader, test_loader = get_loader(args)
     if args.dataset == 'cifar100':
-        train_loader_list, test_loader_list, classes_list  = get_loader_splitCifar100(args, split_num = 10)
+        train_loader_list, test_loader_list, classes_list  = get_loader_splitCifar100(args, split_num=10, rank=rank)
     elif args.dataset == 'imagenet':
-        train_loader_list, test_loader_list, classes_list  = get_loader_splitImagenet(args, split_num = 10)
+        train_loader_list, test_loader_list, classes_list  = get_loader_splitImagenet(args, split_num=10)
     elif args.dataset == 'VD':
         train_loader_list, test_loader_list, classes_list  = get_VD_loader(args)
 
     all_task_specific_param = 0
     for task in range(args.start_task, 10):
 
-        if task != 0:
+        if task == 1:
             pre_model_dict = model.state_dict()
 
-        args, model, all_task_specific_param, config = setup(args, task, all_task_specific_param)
+        args, model, all_task_specific_param, config = setup(
+            args, 
+            task, 
+            (None if args.local_rank == -1 else rank), 
+            all_task_specific_param)
 
         if task != 0:
             pre_model_keys = [k for k, v in pre_model_dict.items()]
-            model_dict = model.state_dict()
             new_model_dict = {}
-            for k, v in model_dict.items():
-                if k in pre_model_keys and 'unc_filt' not in k:
-                    # print(k)
+            for k, v in model.state_dict().items():
+                if k in pre_model_keys and 'unc_filt' not in k and 'weights_mat' not in k:
                     new_model_dict[k] = pre_model_dict[k]
                 else:
                     new_model_dict[k] = v
@@ -245,6 +275,41 @@ def train(args):
 
         train_loader = train_loader_list[task]
         test_loader = test_loader_list[task]
+
+        print('----------------------------')
+        # for name, param in model.named_parameters():
+        #     if 'concat_unc_filt' in name:
+        #         print(name)
+
+        if task != 0 and args.lamb != 1.:
+            
+            idx = 0
+
+            for name, layer in model.named_modules():
+                if isinstance(layer, PiggybackConv):
+                    # print(name)
+                    layer.concat_unc_filter = torch.cat(unc_filt_list[idx], dim=0)
+                    idx += 1
+
+            # if 'ResNet' in args.model_type:
+            #     for name, layer in model.named_modules():
+            #         if isinstance(layer, PiggybackConv):
+            #             # print(name)
+            #             layer.concat_unc_filter = torch.cat(unc_filt_list[idx], dim=0)
+            #             idx += 1
+
+            # else:
+            #     # 後でresnetのように簡単に書き換える
+            #     layer_list = list(model.transformer.encoder.layer)
+            #     # print(layer_list)
+            #     for layer in layer_list:
+            #         for mdls in layer.modules():
+            #             for mdl in mdls.modules():
+            #                 if isinstance(mdl, PiggybackFC):
+            #                     mdl.concat_unc_filter = torch.cat(unc_filt_list[idx], dim=0)
+            #                     idx += 1
+
+        print('----------------------------')
 
         if args.model_type == 'ViT-B_16_RKRPBG':
             if task == 0: # 試しに
@@ -261,7 +326,7 @@ def train(args):
                         param.requires_grad = True
                     if 'unc_filt' in name:
                         param.requires_grad = True
-        elif args.model_type == 'ViT-B_16_PBG':
+        elif args.model_type in ['ResNet18_PBG', 'ViT-B_16_PBG', 'Swin_PBG']:
             if task == 0:
                 for name, param in model.named_parameters():
                     param.requires_grad = True
@@ -272,58 +337,12 @@ def train(args):
                         param.requires_grad = True
                     if 'weights_mat' in name:
                         param.requires_grad = True
-                    if 'unc_filt' in name:
+                    if 'unc_filt' in name and 'concat_unc_filter' not in name:
                         param.requires_grad = True
 
-        print('----------------------------')
-        # for name, param in model.named_parameters():
-        #     if 'concat_unc_filter' in name:
-        #         print(name)
-
-        if task != 0 and args.lamb != 1.:
-            state_dict_keys = model.state_dict().keys()
-            # for dict_name in state_dict_keys:
-            #     if 'concat_unc_filter' in dict_name:
-            #         print(dict_name)
-            
-            layer_list = list(model.transformer.encoder.layer)
-            # print(layer_list)
-            idx = 0
-
-            if 'SFG' in args.model_type:
-                for layer in layer_list:
-                    layer.ffn.SFG1.SFG_concat_unc_filter.data = torch.cat(unc_filter_dic[idx], dim=0)
-                    layer.ffn.SFG2.SFG_concat_unc_filter.data = torch.cat(unc_filter_dic[idx + 1], dim=0)
-                    layer.attn.SFG_query.SFG_concat_unc_filter.data = torch.cat(unc_filter_dic[idx + 2], dim=0)
-                    layer.attn.SFG_key.SFG_concat_unc_filter.data = torch.cat(unc_filter_dic[idx + 3], dim=0)
-                    layer.attn.SFG_value.SFG_concat_unc_filter.data = torch.cat(unc_filter_dic[idx + 4], dim=0)
-                    layer.attn.SFG_out.SFG_concat_unc_filter.data = torch.cat(unc_filter_dic[idx + 5], dim=0)
-                    idx += 6
-            else:
-                for layer in layer_list:
-                    layer.ffn.fc1.concat_unc_filter.data = torch.cat(unc_filter_dic[idx], dim=0)
-                    layer.ffn.fc2.concat_unc_filter.data = torch.cat(unc_filter_dic[idx + 1], dim=0)
-                    layer.attn.query.concat_unc_filter.data = torch.cat(unc_filter_dic[idx + 2], dim=0)
-                    layer.attn.key.concat_unc_filter.data = torch.cat(unc_filter_dic[idx + 3], dim=0)
-                    layer.attn.value.concat_unc_filter.data = torch.cat(unc_filter_dic[idx + 4], dim=0)
-                    layer.attn.out.concat_unc_filter.data = torch.cat(unc_filter_dic[idx + 5], dim=0)
-                    idx += 6
-
-        # RGの場合
-        # unc_filter_dic name transformer.encoder.layer.0.ffn.fc1.unc_filt_LM
-        # unc_filter_dic name transformer.encoder.layer.0.ffn.fc1.unc_filt_RM
-        # unc_filter_dic name transformer.encoder.layer.0.ffn.fc2.unc_filt_LM
-        # unc_filter_dic name transformer.encoder.layer.0.ffn.fc2.unc_filt_RM
-        # unc_filter_dic name transformer.encoder.layer.0.attn.query.unc_filt_LM
-        # unc_filter_dic name transformer.encoder.layer.0.attn.query.unc_filt_RM
-        # unc_filter_dic name transformer.encoder.layer.0.attn.key.unc_filt_LM
-        # unc_filter_dic name transformer.encoder.layer.0.attn.key.unc_filt_RM
-        # unc_filter_dic name transformer.encoder.layer.0.attn.value.unc_filt_LM
-        # unc_filter_dic name transformer.encoder.layer.0.attn.value.unc_filt_RM
-        # unc_filter_dic name transformer.encoder.layer.0.attn.out.unc_filt_LM
-        # unc_filter_dic name transformer.encoder.layer.0.attn.out.unc_filt_RM
-
-        print('----------------------------')
+        for name, param in model.named_parameters():
+            if param.requires_grad == True:
+                logger.info(name)
 
         # Prepare optimizer and scheduler
         optimizer = torch.optim.SGD(model.parameters(),
@@ -365,7 +384,10 @@ def train(args):
                                 # disable=args.local_rank not in [-1, 0]
                                 )
             for step, batch in enumerate(epoch_iterator):
-                batch = tuple(t.to(args.device) for t in batch)
+                if args.local_rank != -1:
+                    batch = tuple(t.to(rank) for t in batch)
+                else:
+                    batch = tuple(t.to(args.device) for t in batch)
                 x, y = batch
                 loss = model(x, y, task)
 
@@ -396,14 +418,12 @@ def train(args):
                     #     writer.add_scalar("train/lr{}".format(task), scalar_value=scheduler.get_lr()[0], global_step=global_step)
                     if global_step % args.eval_every == 0:
                     # if global_step % args.eval_every == 0 and args.local_rank in [-1, 0]:
-                        accuracy = valid(args, model, test_loader, global_step, task)
+                        accuracy = valid(args, model, test_loader, global_step, task, rank)
                         if best_acc < accuracy:
                             # save_model(args, model, task)
                             best_acc = accuracy
                         model.train()
 
-                    if args.local_rank != -1:
-                        dist.barrier()
                     if global_step % t_total == 0:
                         break
 
@@ -421,44 +441,53 @@ def train(args):
         if args.lamb != 1.:
             if args.model_type == 'ViT-B_16_RKRPBG':
                 # 非制約フィルタの中身を取り出す
-                unc_filter_LM_dic = {}
-                unc_filter_RM_dic = {}
+                unc_filt_LM_dic = {}
+                unc_filt_RM_dic = {}
                 filter_LM_idx = 0
                 filter_RM_idx = 0
                 for name, param in model.named_parameters():
                     param.requires_grad = False
                     if 'unc_filt_LM' in name:
                         # print(name, '/', filter_LM_idx, param.shape)
-                        unc_filter_LM_dic[filter_LM_idx] = param.detach()
+                        unc_filt_LM_dic[filter_LM_idx] = param.detach()
                         filter_LM_idx += 1
                     elif 'unc_filt_RM' in name:
                         # print(name, '/', filter_RM_idx, param.shape)
-                        unc_filter_RM_dic[filter_RM_idx] = param.detach()
+                        unc_filt_RM_dic[filter_RM_idx] = param.detach()
                         filter_RM_idx += 1
                 filter_idx = filter_LM_idx
 
-                unc_filter_task_dic = {i: torch.matmul(unc_filter_LM_dic[i], unc_filter_RM_dic[i]) for i in range(filter_idx)}
+                unc_filter_task_dic = {i: torch.matmul(unc_filt_LM_dic[i], unc_filt_RM_dic[i]) for i in range(filter_idx)}
             
-            elif args.model_type == 'ViT-B_16_PBG':
-                # 非制約フィルタの中身を取り出す
-                unc_filter_dic = {}
-                filter_idx = 0
-                for name, param in model.named_parameters():
-                    param.requires_grad = False
-                    if 'unc_filt' in name:
-                        unc_filter_dic[filter_idx] = param.detach()
-                        filter_idx += 1
+            # elif args.model_type == 'ViT-B_16_PBG':
+            #     # 非制約フィルタの中身を取り出す
+            #     layer_list = list(model.transformer.encoder.layer)
+            #     task_unc_filt_list = []
+            #     for layer in layer_list:
+            #         for mdls in layer.modules():
+            #             for mdl in mdls.modules():
+            #                 if isinstance(mdl, PiggybackFC):
+            #                     task_unc_filt_list.append(mdl.unc_filt.detach())
 
-                unc_filter_task_dic = {i: unc_filter_dic[i] for i in range(filter_idx)}
+            # elif args.model_type == 'ResNet18_PBG':
+            #     task_unc_filt_list = []
+            #     for name, layer in model.named_modules():
+            #         if isinstance(layer, PiggybackConv):
+            #             task_unc_filt_list.append(layer.unc_filt.detach())
+            else:
+                task_unc_filt_list = []
+                for name, layer in model.named_modules():
+                    if isinstance(layer, PiggybackConv):
+                        task_unc_filt_list.append(layer.unc_filt.detach())
 
             # 非制約フィルタの値をフィルタリストに入れる
             if task == 0:
-                unc_filter_dic = {}
-                for i in range(filter_idx):
-                        unc_filter_dic[i] = [unc_filter_task_dic[i]]
+                unc_filt_list = []
+                for task_unc_filt in task_unc_filt_list:
+                        unc_filt_list.append([task_unc_filt])
             else:
-                for i in range(filter_idx):
-                    unc_filter_dic[i].append(unc_filter_task_dic[i])
+                for i, task_unc_filt in enumerate(task_unc_filt_list):
+                    unc_filt_list[i].append(task_unc_filt)
 
     # if args.local_rank in [-1, 0]:
     #     writer.close()
@@ -472,10 +501,10 @@ def main():
     parser.add_argument("--dataset", choices=["cifar10", "cifar100", "imagenet", 'VD'], default="cifar10",
                         help="Which downstream task.")
     parser.add_argument("--model_type", choices=[
-        "ViT-B_16", "ViT-B_16_FC", 
-        "ViT-B_16_RKR", "ViT-B_16_RKRnoRG", "ViT-B_16_RKRnoSFG",
+        "ResNet18_PBG",
         "ViT-B_16_PBG", "ViT-B_16_RKRPBG",
-        "ViT-B_32", "ViT-L_16", "ViT-L_32", "ViT-H_14", "R50-ViT-B_16"],
+        "Swin_PBG", 
+        ],
                         default="ViT-B_16",
                         help="Which variant to use.")
     parser.add_argument("--pretrained_dir", type=str, default="checkpoint/ViT-B_16.npz",
@@ -529,49 +558,60 @@ def main():
                              "Positive power of 2: static loss scaling value.\n")
     args = parser.parse_args()
 
-    # Set seed
+    # Set seed  
     set_seed(args)
-
-    if args.gpu_id != None:
-        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
-
-    # DDP
-    args.world_size = args.n_gpu = torch.cuda.device_count()
-    args.is_master = args.local_rank == 0
-    if args.local_rank != -1:
-        torch.cuda.set_device(args.local_rank)  
-        dist.init_process_group(backend='nccl', init_method='env://')
-
-    #handler2を作成
-    handler = logging.FileHandler(filename="./logfile/{}.log".format(args.name))  #handler2はファイル出力
-    handler.setLevel(logging.INFO)
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)8s %(message)s"))
-
-    #loggerにハンドラを設定
-    logger.addHandler(handler)
-
-    # Setup CUDA, GPU & distributed training
-    # if args.local_rank == -1:
-    #     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    #     args.n_gpu = torch.cuda.device_count()
-    # else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
-    #     torch.cuda.set_device(args.local_rank)
-    #     device = torch.device("cuda", args.local_rank)
-    #     torch.distributed.init_process_group(backend='nccl',
-    #                                          timeout=timedelta(minutes=60))
-    #     args.n_gpu = torch.cuda.device_count()
 
     args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # parallelしない時
+    if args.gpu_id != None:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
+    
+    # DDP
+    args.world_size = args.n_gpu = torch.cuda.device_count()
+    args.is_master = args.local_rank == 0
+
+    if args.local_rank != -1:
+        if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+            rank = int(os.environ["RANK"])
+            args.world_size = int(os.environ['WORLD_SIZE'])
+            print(f"RANK and WORLD_SIZE in environ: {rank}/{args.world_size}")
+        else:
+            print('The environment variable "RANK" or "WORLD_SIZE" does not exist.')
+            sys.exit(1)
+        
+        dist.init_process_group(backend='nccl', init_method='env://', world_size=args.world_size, rank=rank)
+
+
+    # ファイル出力するhandlerを設定
+    if args.local_rank == -1 or (args.local_rank != -1 and rank == 0):
+        if 'ResNet' in args.model_type:
+            dir_model = 'ResNet'
+        elif 'ViT' in args.model_type:
+            dir_model = 'ViT'
+        elif 'Swin' in args.model_type:
+            dir_model = 'Swin'
+
+        handler = logging.FileHandler(filename="./logfile/{}/{}.log".format(dir_model, args.name))
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)8s %(message)s"))
+        logger.addHandler(handler)
+
     # Setup logging
-    logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
-                        datefmt='%m/%d/%Y %H:%M:%S',
-                        level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN)
+    if args.local_rank != -1:
+        logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+                            datefmt='%m/%d/%Y %H:%M:%S',
+                            level=logging.INFO if rank == 0 else logging.WARN)
+    else:
+        logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
+                            datefmt='%m/%d/%Y %H:%M:%S',
+                            level=logging.INFO)
+
     logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s" %
                    (args.local_rank, args.device, args.n_gpu, bool(args.local_rank != -1), args.fp16))
 
     # Training
-    train(args)
+    train(args, rank=(None if args.local_rank == -1 else rank))
 
     if args.local_rank != -1:
         # destrory all processes
