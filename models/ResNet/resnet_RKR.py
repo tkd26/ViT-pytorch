@@ -155,7 +155,6 @@ class BasicBlock(nn.Module):
             identity = self.downsample[0](x, task)
             # identity = self.downsample[0](x)
 
-            # スキップのRG，SFGをなしにする
             if self.SFG:
                 identity = self.sfg_down_conv(identity, task=task)
             identity = self.downsample[1](identity)

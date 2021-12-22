@@ -2,12 +2,12 @@ import sys
 import torch
 from torch import Tensor
 import torch.nn as nn
-from torch.nn import init
 from .utils import load_state_dict_from_url
 from typing import Type, Any, Callable, Union, List, Optional
 
 from math import sqrt
-import math
+
+from .layers_PB import ElementWiseRG, ElementWiseSFG
 
 __all__ = ['ResNet', 'resnet18', 'resnet34', 'resnet50', 'resnet101',
            'resnet152', 'resnext50_32x4d', 'resnext101_32x8d',
@@ -25,58 +25,6 @@ model_urls = {
     'wide_resnet50_2': 'https://download.pytorch.org/models/wide_resnet50_2-95faca4d.pth',
     'wide_resnet101_2': 'https://download.pytorch.org/models/wide_resnet101_2-32ee1156.pth',
 }
-
-class PiggybackConv(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=False, task=0, config=None):
-        super(PiggybackConv, self).__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.padding = padding
-        self.dilation = dilation
-        self.groups = groups
-        if bias:
-            self.bias = nn.Parameter(torch.Tensor(self.out_channels))
-        else:
-            self.register_parameter('bias', None)
-        
-        self.task = task 
-        self.lambdas = config.lamb
-        self.lamb_num = math.ceil(self.lambdas*out_channels)
-        self.lamb_rem_num = out_channels - self.lamb_num
-
-        if self.task == 0:
-            self.unc_filt = nn.Parameter(
-                init.normal_(torch.Tensor(self.out_channels, self.in_channels, self.kernel_size, self.kernel_size), 0.0, 0.02))
-        else: 
-            # after training, save unc_filt and weight_mat into files, so that u can use it now. 
-            self.unc_filt = nn.Parameter(
-                init.normal_(torch.Tensor(self.lamb_num, self.in_channels, self.kernel_size, self.kernel_size), 0.0, 0.02)) 
-            self.weights_mat = nn.Parameter(
-                init.normal_(torch.Tensor((self.out_channels + (self.task-1)*self.lamb_num), self.lamb_rem_num), 0.0, 0.02))
-            # self.register_buffer('concat_unc_filter', torch.cat(unc_filt_list, dim=0))
-            self.register_buffer(
-                'concat_unc_filter', 
-                torch.Tensor(
-                    self.out_channels + (self.task - 1) * self.lamb_num, self.in_channels, self.kernel_size, self.kernel_size))
-
-    def forward(self, input_x, task):
-        if self.task == 0:
-            return nn.functional.conv2d(
-                input_x, self.unc_filt, 
-                bias=self.bias, stride=self.stride, padding=self.padding, dilation=self.dilation, groups=self.groups)           
-        else:
-            self.reshape_unc = torch.reshape(self.concat_unc_filter, (self.concat_unc_filter.shape[1]*self.concat_unc_filter.shape[2]*self.concat_unc_filter.shape[3], self.concat_unc_filter.shape[0]))
-            self.reshape_unc_mul_w = torch.matmul(self.reshape_unc, self.weights_mat)
-            self.pb_filt = torch.reshape(self.reshape_unc_mul_w, (self.reshape_unc_mul_w.shape[1], self.concat_unc_filter.shape[1], self.concat_unc_filter.shape[2], self.concat_unc_filter.shape[3]))
-            self.final_weight_mat = torch.cat((self.unc_filt, self.pb_filt),dim=0)
-            self.final_weight_mat = self.final_weight_mat.to(input_x.device)
-
-            return nn.functional.conv2d(
-                input_x, self.final_weight_mat, 
-                bias=self.bias, stride=self.stride, padding=self.padding, dilation=self.dilation, groups=self.groups)
-
 
 def conv3x3(in_planes: int, out_planes: int, stride: int = 1, groups: int = 1, dilation: int = 1) -> nn.Conv2d:
     """3x3 convolution with padding"""
@@ -105,9 +53,10 @@ class BasicBlock(nn.Module):
         dilation: int = 1,
         norm_layer: Optional[Callable[..., nn.Module]] = None,
         config = None,
-        task = None,
     ) -> None:
         super(BasicBlock, self).__init__()
+
+        self.SFG = config.SFG
 
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
@@ -126,25 +75,36 @@ class BasicBlock(nn.Module):
         self.downsample = downsample
         self.stride = stride 
 
-        self.conv1 = PiggybackConv(inplanes, planes, kernel_size=3, stride=stride, padding=1, dilation=1, config=config, task=task)
-        self.conv2 = PiggybackConv(planes, planes, kernel_size=3, stride=1, padding=1, dilation=1, config=config, task=task)
+        self.conv1 = ElementWiseRG(inplanes, planes, kernel_size=3, stride=stride, padding=1, dilation=1, config=config)
+        self.conv2 = ElementWiseRG(planes, planes, kernel_size=3, stride=1, padding=1, dilation=1, config=config)
+        
+        if self.SFG:
+            self.sfg1 = ElementWiseSFG(planes, config)
+            self.sfg2 = ElementWiseSFG(planes, config)
+            if self.downsample is not None:
+                self.sfg_down_conv = ElementWiseSFG(planes * self.expansion, config)
 
     def forward(self, x: Tensor, task: int) -> Tensor:
         identity = x
 
         out = self.conv1(x, task)
+        if self.SFG: 
+            out = self.sfg1(out, task=task)
 
         out = self.bn1(out)
         out = self.relu(out)
 
         out = self.conv2(out, task)
+        if self.SFG:
+            out = self.sfg2(out, task=task)
 
         out = self.bn2(out)
 
         if self.downsample is not None:
             identity = self.downsample[0](x, task)
             # identity = self.downsample[0](x)
-
+            if self.SFG:
+                identity = self.sfg_down_conv(identity, task=task)
             identity = self.downsample[1](identity)
 
         out += identity
@@ -221,7 +181,6 @@ class ResNet(nn.Module):
         layers: List[int],
         num_classes,
         config,
-        task,
         zero_init_residual: bool = False,
         groups: int = 1,
         width_per_group: int = 64,
@@ -230,7 +189,8 @@ class ResNet(nn.Module):
     ) -> None:
         super(ResNet, self).__init__()
 
-        self.task = task
+        self.SFG = config.SFG
+
         self.layers = layers
 
         if norm_layer is None:
@@ -249,9 +209,12 @@ class ResNet(nn.Module):
         self.groups = groups
         self.base_width = width_per_group
 
-        self.conv1 = PiggybackConv(3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False, config=config, task=self.task)
+        self.conv1 = ElementWiseRG(3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False, config=config)
         # self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False)
         
+        if self.SFG:
+            self.sfg_conv = ElementWiseSFG(self.inplanes, config)
+
         # self.bn1_list = nn.ModuleList([norm_layer(self.inplanes) for _ in range(config.task_num)])
         self.bn1 = norm_layer(self.inplanes, affine=False)
         self.relu = nn.ReLU(inplace=True)
@@ -265,11 +228,11 @@ class ResNet(nn.Module):
                                        dilate=replace_stride_with_dilation[2], config=config)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
 
-        self.head = nn.Linear(512 * block.expansion, num_classes)
+        self.head = nn.ModuleList([nn.Linear(512 * block.expansion, task_class) for task_class in num_classes])
 
         for m in self.modules():
-            if isinstance(m, PiggybackConv):
-                nn.init.kaiming_normal_(m.unc_filt, mode='fan_out', nonlinearity='relu')
+            if isinstance(m, ElementWiseRG):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             # if isinstance(m, nn.Conv2d):
             #     nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             # elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
@@ -296,7 +259,7 @@ class ResNet(nn.Module):
             stride = 1
         if stride != 1 or self.inplanes != planes * block.expansion: 
             downsample = nn.ModuleList([
-                PiggybackConv(self.inplanes, planes * block.expansion, 1, stride, config=config, task=self.task),
+                ElementWiseRG(self.inplanes, planes * block.expansion, 1, stride, config=config),
                 norm_layer(planes * block.expansion, affine=False),
             ])
 
@@ -307,12 +270,12 @@ class ResNet(nn.Module):
 
         layers = []
         layers.append(block(self.inplanes, planes, stride, downsample, self.groups,
-                            self.base_width, previous_dilation, norm_layer, config, task=self.task))
+                            self.base_width, previous_dilation, norm_layer, config))
         self.inplanes = planes * block.expansion
         for _ in range(1, blocks):
             layers.append(block(self.inplanes, planes, groups=self.groups,
                                 base_width=self.base_width, dilation=self.dilation,
-                                norm_layer=norm_layer, config=config, task=self.task))
+                                norm_layer=norm_layer, config=config))
 
         return nn.ModuleList(layers)
 
@@ -321,6 +284,8 @@ class ResNet(nn.Module):
         # See note [TorchScript super()]
 
         x = self.conv1(x, task)
+        if self.SFG:
+            x = self.sfg_conv(x, task=task)
 
         # x = self.bn1_list[task](x)
         x = self.bn1(x)
@@ -339,7 +304,7 @@ class ResNet(nn.Module):
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
 
-        x = self.head(x)
+        x = self.head[task](x)
         
         return x
 

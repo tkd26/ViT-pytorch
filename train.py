@@ -23,10 +23,12 @@ from models.config import get_config
 
 from models.ResNet.resnet_RKR import resnet18 as ResNet18_RKR
 from models.ResNet.resnet_PB import resnet18 as ResNet18_PB
+from models.ResNet.resnet_RKRPB import resnet18 as ResNet18_RKRPB
 
 from models.ViT.modeling import VisionTransformer
 from models.ViT.modeling_RKR import VisionTransformer as VisionTransformer_RKR
 from models.ViT.modeling_PB import VisionTransformer as VisionTransformer_PB
+from models.ViT.modeling_RKRPB import VisionTransformer as VisionTransformer_RKRPB
 
 from models.Swin.swin_RKR import SwinTransformer as SwinTransformer_RKR
 from models.Swin.swin_PB import SwinTransformer as SwinTransformer_PB
@@ -139,6 +141,8 @@ def setup(args, task=0, rank=None):
             model = ResNet18_RKR(pretrained=False, num_classes=num_classes[task], config=config)
         elif args.model_type == 'ResNet18_PB':
             model = ResNet18_PB(pretrained=False, num_classes=num_classes, config=config)
+        elif args.model_type == 'ResNet18_RKRPB':
+            model = ResNet18_RKRPB(pretrained=False, num_classes=num_classes, config=config)
         else:
             model = ResNet18_RKR(pretrained=False, num_classes=num_classes, config=config)
 
@@ -147,6 +151,8 @@ def setup(args, task=0, rank=None):
             model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes[task])
         elif args.model_type == 'ViT-B_16_PB':
             model = VisionTransformer_PB(config, args.img_size, zero_head=True, num_classes=num_classes)
+        elif args.model_type == 'ViT-B_16_RKRPB':
+            model = VisionTransformer_RKRPB(config, args.img_size, zero_head=True, num_classes=num_classes)
         else:
             model = VisionTransformer_RKR(config, args.img_size, zero_head=True, num_classes=num_classes)
 
@@ -176,23 +182,24 @@ def setup(args, task=0, rank=None):
 
     logger.info("{}".format(config))
     logger.info("Training parameters %s", args)
-    logger.info("Total Parameter: \t%2.1fM" % num_params)
-    if args.model_type in ['ResNet18_PB', 'ViT-B_16_PB', 'Swin_PB']:
+    logger.info("Total Parameter: \t%d" % num_params)
+    if args.model_type in ['ResNet18_PB', 'ResNet18_RKRPB', 'ViT-B_16_PB', 'ViT-B_16_RKRPB', 'Swin_PB']:
         params, mask_params = count_parameters_PB(model)
-        logger.info("Total Parameter: \t%2.1fM + \t%2.1fM = \t%2.1fM" % (params, mask_params, params + mask_params))
+        logger.info("Total Parameter: \t%d + \t%d = \t%d" % (params, mask_params, params + mask_params))
+        
     return args, model, config
 
 
 def count_parameters(model):
     params = sum(p.numel() for p in model.parameters())
     # params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return params/1000000
+    return params
 
 def count_parameters_PB(model):
     params = sum(p.numel() for name, p in model.named_parameters() if 'mask_reals' not in name)
     mask_params = sum(p.numel() for name, p in model.named_parameters() if 'mask_reals' in name)
     mask_params /= 32 # cnnのパラメータは32bit，バイナリマスクは1bitなので，1/32になる
-    return params/1000000, mask_params/1000000
+    return params, mask_params
 
 def set_seed(args):
     random.seed(args.seed)
@@ -310,6 +317,27 @@ def train(args, model, config, rank=None):
                 if 'head' in name:
                     if name.split('.')[-2] == str(task):
                         param.requires_grad = True
+        # RKRPBでの設定
+        elif args.model_type in ['ResNet18_RKRPB', 'ViT-B_16_RKRPB']:
+            if task == 0:
+                for name, param in model.named_parameters():
+                    param.requires_grad = False
+                    if 'LM_base' in name or 'RM_base' in name:
+                        param.requires_grad = True
+                    if 'head' in name:
+                        if name.split('.')[-2] == str(task):
+                            param.requires_grad = True
+                    if 'F_base' in name:
+                        param.requires_grad = True
+            else:
+                for name, param in model.named_parameters():
+                    param.requires_grad = False
+                    if 'mask_reals' in name:
+                        if name.split('.')[-1] == str(task - 1): # maskのインデックスはtask-1
+                            param.requires_grad = True
+                    if 'head' in name:
+                        if name.split('.')[-2] == str(task):
+                            param.requires_grad = True
         # それ以外のSingle以外
         elif args.model_type not in ['ResNet18', 'ViT-B_16', 'Swin']:
             for name, param in model.named_parameters():
@@ -435,8 +463,8 @@ def main():
     parser.add_argument("--dataset", choices=["cifar10", "cifar100", "imagenet", 'VD'], default="cifar10",
                         help="Which downstream task.")
     parser.add_argument("--model_type", choices=[
-        "ResNet18", "ResNet18_MultiHead", "ResNet18_RKR", "ResNet18_RKRwoRG", "ResNet18_RKRwoSFG", "ResNet18_PB",
-        "ViT-B_16", "ViT-B_16_MultiHead", "ViT-B_16_RKR", "ViT-B_16_RKRwoRG", "ViT-B_16_RKRwoSFG", "ViT-B_16_PB",
+        "ResNet18", "ResNet18_MultiHead", "ResNet18_RKR", "ResNet18_RKRwoRG", "ResNet18_RKRwoSFG", "ResNet18_PB", "ResNet18_RKRPB",
+        "ViT-B_16", "ViT-B_16_MultiHead", "ViT-B_16_RKR", "ViT-B_16_RKRwoRG", "ViT-B_16_RKRwoSFG", "ViT-B_16_PB", "ViT-B_16_RKRPB",
         "Swin", "Swin_MultiHead", "Swin_RKR", 'Swin_PB',
         ],
                         default="ViT-B_16",
@@ -496,11 +524,11 @@ def main():
     # Set seed  
     set_seed(args)
 
-    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     # parallelしない時
     if args.gpu_id != None:
         os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
+
+    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     # DDP
     args.world_size = args.n_gpu = torch.cuda.device_count()

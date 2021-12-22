@@ -138,16 +138,16 @@ def setup(args, task, rank, all_task_specific_param):
     logger.info("{}".format(config))
     logger.info("Training parameters %s", args)
     # logger.info("Total Parameter: \t%2.1fM" % num_params)
-    logger.info("Global Parameter: \t%2.1fM" % global_param)
-    logger.info("Task Specific Parameter: \t%2.1fM" % task_specific_param)
-    logger.info("All Task Specific Parameter: \t%2.1fM" % all_task_specific_param)
-    logger.info("Total Parameter: \t%2.1fM" % (global_param + all_task_specific_param))
+    logger.info("Global Parameter: \t%d" % global_param)
+    logger.info("Task Specific Parameter: \t%d" % task_specific_param)
+    logger.info("All Task Specific Parameter: \t%d" % all_task_specific_param)
+    logger.info("Total Parameter: \t%d" % (global_param + all_task_specific_param))
     return args, model, all_task_specific_param, config
 
 
 def count_parameters(model):
     params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    return params/1000000
+    return params
 
 def count_task_parameters(model):
     task_specific_params = []
@@ -165,7 +165,7 @@ def count_task_parameters(model):
             global_params.append(param.numel())
     task_specific_param = sum(task_specific_params)
     global_param = sum(global_params)
-    return global_param/1000000, task_specific_param/1000000
+    return global_param, task_specific_param
 
 
 def set_seed(args):
@@ -433,7 +433,7 @@ def train(args, rank=None):
 
         # DDP
         if args.local_rank != -1:
-            dist.all_reduce(torch.tensor(best_acc).to(args.device), op=dist.ReduceOp.SUM)
+            dist.all_reduce(torch.tensor(best_acc).to(rank), op=dist.ReduceOp.SUM)
 
         logger.info("Task%d Best Accuracy: \t%f" % (task, best_acc))
         logger.info("End Training!")
@@ -560,13 +560,13 @@ def main():
 
     # Set seed  
     set_seed(args)
-
-    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    
     # parallelしない時
     if args.gpu_id != None:
         os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
-    
+
+    args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     # DDP
     args.world_size = args.n_gpu = torch.cuda.device_count()
     args.is_master = args.local_rank == 0

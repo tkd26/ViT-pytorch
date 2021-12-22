@@ -58,9 +58,21 @@ def get_resnet18_RKRwoSFG_config():
     return config
 
 def get_resnet18_PB_config():
-    """Returns the ViT-B/16 configuration."""
     config = ml_collections.ConfigDict()
     # config.model = ml_collections.ConfigDict()
+    config.threshold_fn = 'binarizer'
+    config.mask_scale = 1e-2
+    config.mask_init = '1s'
+    return config
+
+def get_resnet18_RKRPB_config():
+    config = ml_collections.ConfigDict()
+    # config.model = ml_collections.ConfigDict()
+    config.RG = True
+    config.SFG = True
+    config.multi_head = True
+    config.K = 2
+    config.rkr_scale = 1e-1
     config.threshold_fn = 'binarizer'
     config.mask_scale = 1e-2
     config.mask_init = '1s'
@@ -138,13 +150,24 @@ class ViTConfig(object):
         output_config.multi_head = True
         output_config.K = 2
         output_config.lamb = 1.0 # distillの割合
-        output_config.rkr_scale = 1e-1
         output_config.task_emb_d = 50
         return output_config
 
     def get_b16_PB_config(self):
         output_config = deepcopy(self.config)
         output_config.multi_head = True
+        output_config.threshold_fn = 'binarizer'
+        output_config.mask_scale = 1e-2
+        output_config.mask_init = '1s'
+        return output_config
+
+    def get_b16_RKRPB_config(self):
+        output_config = deepcopy(self.config)
+        output_config.RG = True
+        output_config.SFG = True
+        output_config.multi_head = True
+        output_config.K = 2
+        output_config.rkr_scale = 1e-1
         output_config.threshold_fn = 'binarizer'
         output_config.mask_scale = 1e-2
         output_config.mask_init = '1s'
@@ -268,6 +291,7 @@ def get_config(model_type, dataset=None):
         'ResNet18_RKRwoRG': get_resnet18_RKRwoRG_config(),
         'ResNet18_RKRwoSFG': get_resnet18_RKRwoSFG_config(),
         'ResNet18_PB': get_resnet18_PB_config(),
+        'ResNet18_RKRPB': get_resnet18_RKRPB_config(),
         'ResNet18_PBG': get_resnet18_PBG_config(),
 
         'ViT-B_16': vit_config.get_b16_config(),
@@ -277,6 +301,7 @@ def get_config(model_type, dataset=None):
         'ViT-B_16_RKRwoSFG': vit_config.get_b16_RKRwoSFG_config(),
         'ViT-B_16_RKRTSN': vit_config.get_b16_RKRTSN_config(),
         'ViT-B_16_PB': vit_config.get_b16_PB_config(),
+        'ViT-B_16_RKRPB': vit_config.get_b16_RKRPB_config(),
         'ViT-B_16_RKRPBG': vit_config.get_b16_RKRPBG_config(),
         'ViT-B_16_PBG': vit_config.get_b16_PBG_config(),
 
