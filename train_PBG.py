@@ -11,6 +11,7 @@ import numpy as np
 from datetime import timedelta
 
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 
 from tqdm import tqdm
@@ -71,6 +72,45 @@ def save_model(args, model, task):
     torch.save(model_to_save.state_dict(), model_checkpoint)
     logger.info("Saved model checkpoint to [DIR: %s]", args.output_dir)
 
+def model_initialization(args, model):
+    if 'ResNet' in args.model_type:
+        # 事前学習済モデルのロード
+        pre_model_dict = torch.load('/host/space0/takeda-m/jupyter/notebook/RKR/model/resnet34-b627a593.pth')
+        pre_model_keys = [k for k, v in pre_model_dict.items()]
+        new_model_dict = {}
+        for k, v in model.state_dict().items():
+            if k in pre_model_keys or 'unc_filt' in k:
+                pre_k = k.replace('.unc_filt', '.weight')
+                new_model_dict[k] = pre_model_dict[pre_k]
+            else:
+                new_model_dict[k] = v
+        model.load_state_dict(new_model_dict)
+
+    elif 'ViT' in args.model_type:
+        model.load_from(np.load(args.pretrained_dir))
+
+    elif 'Swin' in args.model_type:
+        # 事前学習済モデルのロード
+        pre_model_dict = torch.load(args.pretrained_dir)['model']
+        del pre_model_dict['head.weight'], pre_model_dict['head.bias']
+        pre_model_keys = [k for k, v in pre_model_dict.items()]
+
+        new_model_dict = {}
+        for k, v in  model.state_dict().items():
+            if k in pre_model_keys or 'unc_filt' in k:
+                pre_k = k.replace('.unc_filt', '.weight')
+                if pre_model_dict[pre_k].size() != model.state_dict()[k].size():
+                    print('load_pretrained: %s from %s to %s' % (k, pre_model_dict[pre_k].size(), model.state_dict()[k].size()))
+                    new_model_dict[k] = nn.functional.interpolate(
+                        pre_model_dict[pre_k].unsqueeze(0).unsqueeze(0).float(), 
+                        size=model.state_dict()[k].size()).squeeze(0).squeeze(0).long()
+                else:
+                    new_model_dict[k] = pre_model_dict[pre_k]
+            else:
+                new_model_dict[k] = v
+        model.load_state_dict(new_model_dict)
+
+    return model
 
 def setup(args, task, rank, all_task_specific_param):
     # Prepare model
@@ -94,18 +134,6 @@ def setup(args, task, rank, all_task_specific_param):
     if 'ResNet' in args.model_type:
         if args.model_type == 'ResNet18_PBG':
             model = ResNet18_PBG(pretrained=False, num_classes=num_classes[task], config=config, task=task)
-        
-        if task == 0:
-            # 事前学習済モデルのロード
-            pre_model_dict = torch.load('/host/space0/takeda-m/jupyter/notebook/RKR/model/resnet34-b627a593.pth')
-            pre_model_keys = [k for k, v in pre_model_dict.items()]
-            new_model_dict = {}
-            for k, v in model.state_dict().items():
-                if k in pre_model_keys:
-                    new_model_dict[k] = pre_model_dict[k]
-                else:
-                    new_model_dict[k] = v
-            model.load_state_dict(new_model_dict)
 
     elif 'ViT' in args.model_type:
         if args.model_type == 'ViT-B_16_RKRPBG':
@@ -113,11 +141,13 @@ def setup(args, task, rank, all_task_specific_param):
             model.load_from(np.load(args.pretrained_dir))
         elif args.model_type == 'ViT-B_16_PBG':
             model = VisionTransformer_PBG(config, args.img_size, zero_head=True, num_classes=num_classes[task], task=task)
-            if task == 0:
-                model.load_from(np.load(args.pretrained_dir))
+
     elif 'Swin' in args.model_type:
         if args.model_type == 'Swin_PBG':
             model = SwinTransformer_PBG(config, args.img_size, num_classes=num_classes[task], task=task)
+
+    if 'RKRPBG' in args.model_type or task == 0:
+        model = model_initialization(args, model)
 
     # Distributed training
     if args.local_rank != -1:

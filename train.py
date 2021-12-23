@@ -32,6 +32,7 @@ from models.ViT.modeling_RKRPB import VisionTransformer as VisionTransformer_RKR
 
 from models.Swin.swin_RKR import SwinTransformer as SwinTransformer_RKR
 from models.Swin.swin_PB import SwinTransformer as SwinTransformer_PB
+from models.Swin.swin_RKRPB import SwinTransformer as SwinTransformer_RKRPB
 
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
 from utils.data_utils import get_loader, get_loader_splitCifar100, get_loader_splitImagenet, get_VD_loader
@@ -161,6 +162,8 @@ def setup(args, task=0, rank=None):
             model = SwinTransformer_RKR(config, args.img_size, num_classes=num_classes[task])
         elif args.model_type == 'Swin_PB':
             model = SwinTransformer_PB(config, args.img_size, num_classes=num_classes)
+        elif args.model_type == 'Swin_RKRPB':
+            model = SwinTransformer_RKRPB(config, args.img_size, num_classes=num_classes)
         else:
             model = SwinTransformer_RKR(config, args.img_size, num_classes=num_classes)
 
@@ -183,7 +186,7 @@ def setup(args, task=0, rank=None):
     logger.info("{}".format(config))
     logger.info("Training parameters %s", args)
     logger.info("Total Parameter: \t%d" % num_params)
-    if args.model_type in ['ResNet18_PB', 'ResNet18_RKRPB', 'ViT-B_16_PB', 'ViT-B_16_RKRPB', 'Swin_PB']:
+    if args.model_type in ['ResNet18_PB', 'ResNet18_RKRPB', 'ViT-B_16_PB', 'ViT-B_16_RKRPB', 'Swin_PB', 'Swin_RKRPB']:
         params, mask_params = count_parameters_PB(model)
         logger.info("Total Parameter: \t%d + \t%d = \t%d" % (params, mask_params, params + mask_params))
         
@@ -318,17 +321,15 @@ def train(args, model, config, rank=None):
                     if name.split('.')[-2] == str(task):
                         param.requires_grad = True
         # RKRPBでの設定
-        elif args.model_type in ['ResNet18_RKRPB', 'ViT-B_16_RKRPB']:
+        elif args.model_type in ['ResNet18_RKRPB', 'ViT-B_16_RKRPB', 'Swin_RKRPB']:
             if task == 0:
                 for name, param in model.named_parameters():
                     param.requires_grad = False
-                    if 'LM_base' in name or 'RM_base' in name:
+                    if 'LM_base' in name or 'RM_base' in name or 'F_base' in name:
                         param.requires_grad = True
                     if 'head' in name:
                         if name.split('.')[-2] == str(task):
                             param.requires_grad = True
-                    if 'F_base' in name:
-                        param.requires_grad = True
             else:
                 for name, param in model.named_parameters():
                     param.requires_grad = False
@@ -465,7 +466,7 @@ def main():
     parser.add_argument("--model_type", choices=[
         "ResNet18", "ResNet18_MultiHead", "ResNet18_RKR", "ResNet18_RKRwoRG", "ResNet18_RKRwoSFG", "ResNet18_PB", "ResNet18_RKRPB",
         "ViT-B_16", "ViT-B_16_MultiHead", "ViT-B_16_RKR", "ViT-B_16_RKRwoRG", "ViT-B_16_RKRwoSFG", "ViT-B_16_PB", "ViT-B_16_RKRPB",
-        "Swin", "Swin_MultiHead", "Swin_RKR", 'Swin_PB',
+        "Swin", "Swin_MultiHead", "Swin_RKR", 'Swin_PB', 'Swin_RKRPB',
         ],
                         default="ViT-B_16",
                         help="Which variant to use.")

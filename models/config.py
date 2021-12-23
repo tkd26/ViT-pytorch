@@ -274,6 +274,18 @@ class SwinConfig(object):
         output_config.mask_init = '1s'
         return output_config
 
+    def get_swin_RKRPB_config(self, dataset=None):
+        output_config = deepcopy(self.config)
+        output_config.RG = True
+        output_config.SFG = True
+        output_config.multi_head = True
+        output_config.K = 2
+        output_config.rkr_scale = 1e-1
+        output_config.threshold_fn = 'binarizer'
+        output_config.mask_scale = 1e-2
+        output_config.mask_init = '1s'
+        return output_config
+
     def get_swin_PBG_config(self, dataset=None):
         output_config = deepcopy(self.config)
         output_config.multi_head = False
@@ -309,6 +321,7 @@ def get_config(model_type, dataset=None):
         'Swin_MultiHead': swin_config.get_swin_MultiHead_config(),
         'Swin_RKR': swin_config.get_swin_RKR_config(),
         'Swin_PB': swin_config.get_swin_PB_config(),
+        'Swin_RKRPB': swin_config.get_swin_RKRPB_config(),
         'Swin_PBG': swin_config.get_swin_PBG_config(),
     }
 
