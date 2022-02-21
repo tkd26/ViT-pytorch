@@ -21,7 +21,7 @@ from apex import amp
 
 from models.config import get_config
 
-from models.ResNet.resnet_RKR import resnet18 as ResNet18_RKR
+from models.ResNet.resnet_RKR import resnet18 as ResNet18_RKR, RG_Conv
 from models.ResNet.resnet_PB import resnet18 as ResNet18_PB
 from models.ResNet.resnet_RKRPB import resnet18 as ResNet18_RKRPB
 
@@ -79,7 +79,7 @@ def save_model(args, model, task):
     torch.save(model_to_save.state_dict(), model_checkpoint)
     logger.info("Saved model checkpoint to [DIR: %s]", args.output_dir)
 
-def model_initialization(args, model):
+def model_initialization(args, config, model):
     if 'ResNet' in args.model_type:
         # 事前学習済モデルのロード
         pre_model_dict = torch.load('/host/space0/takeda-m/jupyter/notebook/RKR/model/resnet34-b627a593.pth')
@@ -92,8 +92,20 @@ def model_initialization(args, model):
                 new_model_dict[k] = v
         model.load_state_dict(new_model_dict)
 
+        if 'RKRPB' in args.model_type:
+            # model = model_RKR_init(args, config, model)
+
+            torch.save(model.state_dict(), './models/resnet18_RKRPB.pth')
+            logger.info("Saved RKRPB model checkpoint")
+
     elif 'ViT' in args.model_type:
         model.load_from(np.load(args.pretrained_dir))
+
+        # if 'RKRPB' in args.model_type:
+        #     model = model_RKR_init(args, config, model)
+
+        #     torch.save(model.state_dict(), './models/vit_RKRPB.pth')
+        #     logger.info("Saved RKRPB model checkpoint")
 
     elif 'Swin' in args.model_type:
         # 事前学習済モデルのロード
@@ -114,6 +126,76 @@ def model_initialization(args, model):
                 new_model_dict[k] = v
         model.load_state_dict(new_model_dict)
 
+        # if 'RKRPB' in args.model_type:
+        #     model = model_RKR_init(args, config, model)
+
+        #     torch.save(model.state_dict(), './models/swin_RKRPB.pth')
+        #     logger.info("Saved RKRPB model checkpoint")
+
+    return model
+
+def get_rating_error(r, p, q):
+    return r - torch.dot(p, q)
+
+def get_error(R, P, Q, beta):
+    error = 0.0
+    for i in range(len(R)):
+        for j in range(len(R[i])):
+            if R[i][j] == 0:
+                continue
+            error += torch.pow(get_rating_error(R[i][j], P[:,i], Q[:,j]), 2)
+    error += beta/2.0 * (torch.norm(P) + torch.norm(Q))
+    return error
+
+def matrix_factorization(args, R, K, steps=5000, alpha=0.0002, beta=0.02, threshold=0.001):
+    if 'ResNet' in args.model_type:
+        R = R.view(R.shape[0] * R.shape[2], R.shape[1] * R.shape[3])
+    R =  R.detach().to(args.device)
+    # P = np.random.rand(K, len(R))
+    # Q = np.random.rand(K, len(R[0]))
+    P = torch.rand(K, len(R)).to(args.device)
+    Q = torch.rand(K, len(R[0])).to(args.device)
+    pre_error = 0
+    for step in range(steps):
+        for i in range(len(R)):
+            for j in range(len(R[i])):
+                if R[i][j] == 0:
+                    continue
+                err = get_rating_error(R[i][j], P[:, i], Q[:, j])
+                for k in range(K):
+                    P[k][i] += alpha * (2 * err * Q[k][j])
+                    Q[k][j] += alpha * (2 * err * P[k][i])
+        error = get_error(R, P, Q, beta)
+        if step % 10 == 0:
+            print(step, error)
+            if pre_error == error or error < threshold:
+                break
+            pre_error = error
+
+    # P = torch.from_numpy(P)
+    # Q = torch.from_numpy(Q)
+    return P, Q
+
+def model_RKR_init(args, config, model, rkr_rate=0.1):
+    new_model_dict = {}
+    for k, v in model.state_dict().items():
+        if 'LM_base' in k:
+            lm_base_name = k
+            rm_base_name = k.replace('LM', 'RM')
+            weight_name = k.replace('LM_base', 'weight')
+
+            rkr_rate = 0.1
+            w = model.state_dict()[weight_name] * (1 - rkr_rate)
+            r = model.state_dict()[weight_name] * (rkr_rate)
+            lm, rm = matrix_factorization(args, R=r, K=config.K)
+            
+            new_model_dict[weight_name] = w
+            new_model_dict[lm_base_name] = lm
+            new_model_dict[rm_base_name] = rm
+            print('make {}, {}'.format(lm_base_name, rm_base_name))
+        else:
+            new_model_dict[k] = v
+    model.load_state_dict(new_model_dict)
     return model
 
 def setup(args, task=0, rank=None):
@@ -128,13 +210,29 @@ def setup(args, task=0, rank=None):
 
     if args.K != None:
         config.K = args.K
+
+    if 'RGnoPB' in args.name:
+        config.RGnoPB = True
+    if 'LMnoPB' in args.name:
+        config.LMnoPB = True
+    if 'RMnoPB' in args.name:
+        config.RMnoPB = True
+    if 'SFGnoPB' in args.name:
+        config.SFGnoPB = True
+
+    if 'PBwR' in args.name:
+        config.PBwR = True
     
     if args.dataset == "cifar100":
         num_classes = [10] * 10
     elif args.dataset == "imagenet":
         num_classes = [100] * 10
     elif args.dataset == "VD":
-        num_classes = [1000, 100, 100, 2, 47, 43, 1623, 10, 101, 102]
+        # num_classes = [1000, 100, 100, 2, 47, 43, 1623, 10, 101, 102]
+        if 'RKRPB' in args.model_type and 'InitTask1' not in args.name:
+            num_classes = [1000, 47, 43, 10, 101, 102]
+        else:
+            num_classes = [47, 43, 10, 101, 102]
     config.task_num = len(num_classes)
 
     if 'ResNet' in args.model_type:
@@ -167,7 +265,7 @@ def setup(args, task=0, rank=None):
         else:
             model = SwinTransformer_RKR(config, args.img_size, num_classes=num_classes)
 
-    model = model_initialization(args, model)
+    model = model_initialization(args, config, model)
 
     # Distributed training
     if args.local_rank != -1:
@@ -277,6 +375,7 @@ def valid(args, model, test_loader, global_step, task, rank=None):
 
 def train(args, model, config, rank=None):
     """ Train the model """
+    best_acc_list = []
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
     # Prepare dataset
@@ -284,13 +383,15 @@ def train(args, model, config, rank=None):
     if args.dataset == 'cifar100':
         train_loader_list, test_loader_list, classes_list  = get_loader_splitCifar100(args, split_num=10, rank=rank)
     elif args.dataset == 'imagenet':
-        train_loader_list, test_loader_list, classes_list  = get_loader_splitImagenet(args, split_num=10)
+        train_loader_list, test_loader_list, classes_list  = get_loader_splitImagenet(args, split_num=10, rank=rank)
     elif args.dataset == 'VD':
-        train_loader_list, test_loader_list, classes_list  = get_VD_loader(args)
+        train_loader_list, test_loader_list, classes_list  = get_VD_loader(args, rank=rank)
 
     for task in range(args.start_task, config.task_num):
 
         if args.model_type in ['ResNet18', 'ViT-B_16', 'Swin'] and task != 0:
+            args, model, _ = setup(args, task, rank=(None if args.local_rank == -1 else rank))
+        if args.model_type in ['ResNet18_RKR', 'ViT-B_16_RKR', 'Swin_RKR'] and task != 0:
             args, model, _ = setup(args, task, rank=(None if args.local_rank == -1 else rank))
 
         train_loader = train_loader_list[task]
@@ -339,6 +440,19 @@ def train(args, model, config, rank=None):
                     if 'head' in name:
                         if name.split('.')[-2] == str(task):
                             param.requires_grad = True
+
+            # PBなし(noPB)の場合の処理
+            if config.SFGnoPB:
+                for name, param in model.named_parameters():
+                    if 'F_list' in name:
+                        if name.split('.')[-1] == str(task):
+                            param.requires_grad = True 
+            if config.RGnoPB or config.LMnoPB or config.RMnoPB:
+                for name, param in model.named_parameters():
+                    if 'LM_list' in name or 'RM_list' in name:
+                        if name.split('.')[-1] == str(task):
+                            param.requires_grad = True
+
         # それ以外のSingle以外
         elif args.model_type not in ['ResNet18', 'ViT-B_16', 'Swin']:
             for name, param in model.named_parameters():
@@ -446,11 +560,15 @@ def train(args, model, config, rank=None):
         if args.local_rank != -1:
             dist.all_reduce(torch.tensor(best_acc).to(rank), op=dist.ReduceOp.SUM)
 
+        best_acc_list.append(best_acc)
         logger.info("Task%d Best Accuracy: \t%f" % (task, best_acc))
         logger.info("End Training!")
 
         if args.model_type in ['ResNet18', 'ViT-B_16', 'Swin']:
             del model
+
+    logger.info("Best Accuracies:")
+    logger.info("{}".format(best_acc_list))
 
     # if args.local_rank in [-1, 0]:
     #     writer.close()
@@ -538,7 +656,8 @@ def main():
     if args.local_rank != -1:
         if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
             rank = int(os.environ["RANK"])
-            args.world_size = int(os.environ['WORLD_SIZE'])
+            # args.world_size = int(os.environ['WORLD_SIZE'])
+            args.world_size = args.n_gpu
             print(f"RANK and WORLD_SIZE in environ: {rank}/{args.world_size}")
         else:
             print('The environment variable "RANK" or "WORLD_SIZE" does not exist.')

@@ -127,7 +127,8 @@ def setup(args, task, rank, all_task_specific_param):
     elif args.dataset == "imagenet":
         num_classes = [100] * 10
     elif args.dataset == "VD":
-        num_classes = [1000, 100, 100, 2, 47, 43, 1623, 10, 101, 102]
+        # num_classes = [1000, 100, 100, 2, 47, 43, 1623, 10, 101, 102]
+        num_classes = [47, 43, 10, 101, 102]
 
     config.task_num = len(num_classes)
 
@@ -184,14 +185,19 @@ def count_task_parameters(model):
     global_params = []
     for name, param in model.named_parameters():
         if 'SFG_F' in name:
+            logger.info("Task Specific : %s" % name)
             task_specific_params.append(param.numel())
         elif 'head' in name:
+            logger.info("Task Specific : %s" % name)
             task_specific_params.append(param.numel())
         elif 'weights_mat' in name:
+            logger.info("Task Specific : %s" % name)
             task_specific_params.append(param.numel())
         elif 'unc_filt' in name and name not in ['concat_unc_filter', 'SFG_concat_unc_filter']:
+            logger.info("Task Specific : %s" % name)
             task_specific_params.append(param.numel())
         else:
+            logger.info("Gloabl : %s" % name)
             global_params.append(param.numel())
     task_specific_param = sum(task_specific_params)
     global_param = sum(global_params)
@@ -297,9 +303,10 @@ def train(args, rank=None):
             pre_model_keys = [k for k, v in pre_model_dict.items()]
             new_model_dict = {}
             for k, v in model.state_dict().items():
-                if k in pre_model_keys and 'unc_filt' not in k and 'weights_mat' not in k:
+                if k in pre_model_keys and 'unc_filt' not in k and 'weights_mat' not in k and 'head' not in k:
                     new_model_dict[k] = pre_model_dict[k]
                 else:
+                    print(k)
                     new_model_dict[k] = v
             model.load_state_dict(new_model_dict)
 

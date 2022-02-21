@@ -173,7 +173,7 @@ def get_loader_splitCifar100(args, split_num, rank=None):
     return trainloader_list, testloader_list, classes_list
 
 
-def get_loader_splitImagenet(args, split_num):
+def get_loader_splitImagenet(args, split_num, rank=None):
 
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
                                      
@@ -201,6 +201,9 @@ def get_loader_splitImagenet(args, split_num):
 
     class_id_list = torch.chunk(torch.Tensor([i for i in range(1000)]), split_num)
 
+    train_num = 0
+    test_num = 0
+
     for i in range(split_num):
         classes_list.append([classes[int(id)] for id in class_id_list[i]])
 
@@ -212,9 +215,9 @@ def get_loader_splitImagenet(args, split_num):
 
         if args.local_rank != -1:
             train_sampler = DistributedSampler(
-                trainset, rank=args.local_rank, shuffle=True, num_replicas=args.world_size)
+                trainset, rank=rank, shuffle=True)
             test_sampler = DistributedSampler(
-                testset, rank=args.local_rank, shuffle=False, num_replicas=args.world_size)
+                testset, rank=rank, shuffle=False)
         else:
             train_sampler = RandomSampler(trainset)
             test_sampler = SequentialSampler(testset)
@@ -237,7 +240,11 @@ def get_loader_splitImagenet(args, split_num):
                 num_workers=4, 
                 pin_memory=True))
         
+        train_num  += len(trainset)
+        test_num  += len(testset)
         print('task{} dataset loaded'.format(i))
+
+    print('train_num: {}, test_num: {}'.format(train_num, test_num))
 
     return trainloader_list, testloader_list, classes_list
 
@@ -261,7 +268,7 @@ def data_transform(args, data_path, name, train=True):
     else:
         transform_train = transforms.Compose([
             transforms.Resize(args.img_size),
-            transforms.RandomCrop(64),
+            transforms.RandomCrop(args.img_size),
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
             transforms.Normalize(means, stds),
@@ -276,7 +283,7 @@ def data_transform(args, data_path, name, train=True):
     else:
         transform_test = transforms.Compose([
             transforms.Resize(args.img_size),
-            transforms.CenterCrop(64),
+            transforms.CenterCrop(args.img_size),
             transforms.ToTensor(),
             transforms.Normalize(means, stds),
         ])
@@ -285,28 +292,46 @@ def data_transform(args, data_path, name, train=True):
     else:
         return transform_test
 
-def get_VD_loader(args):
+def get_VD_loader(args, rank=None):
     data_path = '/home/yanai-lab/takeda-m/space0/dataset/decathlon-1.0/data/'
     trainloader_list = []
     testloader_list = []
     classes_list = []
 
-    do_task_list = ['imagenet12', 'aircraft', 'cifar100', 'daimlerpedcls', 'dtd', 'gtsrb', 'omniglot', 'svhn', 'ucf101', 'vgg-flowers']
+    # do_task_list = ['imagenet12', 'aircraft', 'cifar100', 'daimlerpedcls', 'dtd', 'gtsrb', 'omniglot', 'svhn', 'ucf101', 'vgg-flowers']
+    if 'RKRPB' in args.model_type and 'InitTask1' not in args.name:
+        do_task_list = ['imagenet12', 'dtd', 'gtsrb', 'svhn', 'ucf101', 'vgg-flowers']
+    else:
+        do_task_list = ['dtd', 'gtsrb', 'svhn', 'ucf101', 'vgg-flowers']
     for i, task_name in enumerate(do_task_list):
         if i < args.start_task:
             trainloader = []
             testloader = []
         else:
-            trainloader = torch.utils.data.DataLoader(torchvision.datasets.ImageFolder(data_path + task_name + '/train',
-                                                        transform=data_transform(args, data_path, task_name)),
+            trainset = torchvision.datasets.ImageFolder(data_path + task_name + '/train',
+                                                        transform=data_transform(args, data_path, task_name))
+            testset = torchvision.datasets.ImageFolder(data_path + task_name + '/val',
+                                                        transform=data_transform(args, data_path, task_name, train=False))
+
+            if args.local_rank != -1:
+                train_sampler = DistributedSampler(
+                    trainset, rank=rank, shuffle=True)
+                test_sampler = DistributedSampler(
+                    testset, rank=rank, shuffle=False)
+            else:
+                train_sampler = RandomSampler(trainset)
+                test_sampler = SequentialSampler(testset)
+                
+            trainloader = torch.utils.data.DataLoader(trainset,
                                                         batch_size=args.train_batch_size,
-                                                        shuffle=True,
+                                                        # shuffle=True,
+                                                        sampler=train_sampler,
                                                         num_workers=4, pin_memory=True)
-            testloader = torch.utils.data.DataLoader(torchvision.datasets.ImageFolder(data_path + task_name + '/val',
-                                                        transform=data_transform(args, data_path, task_name, train=False)),
+            testloader = torch.utils.data.DataLoader(testset,
                                                         batch_size=args.eval_batch_size,
-                                                        shuffle=False,
-                                                    num_workers=4, pin_memory=True)
+                                                        # shuffle=False,
+                                                        sampler=test_sampler,
+                                                        num_workers=4, pin_memory=True)
 
         trainloader_list += [trainloader]
         testloader_list += [testloader]

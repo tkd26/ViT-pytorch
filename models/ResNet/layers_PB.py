@@ -164,6 +164,14 @@ class ElementWiseRG(nn.Module):
         self.output_padding = _pair(0)
         self.groups = groups
 
+        # Initialize the thresholder.
+        if threshold_fn == 'binarizer':
+            # print('Calling binarizer with threshold:', threshold)
+            self.threshold_fn = Binarizer(threshold=threshold)
+        elif threshold_fn == 'ternarizer':
+            # print('Calling ternarizer with threshold:', threshold)
+            self.threshold_fn = Ternarizer(threshold=threshold)
+
         # weight and bias are no longer Parameters.
         self.weight = Parameter(nn.init.kaiming_uniform_(torch.Tensor(
             out_channels, in_channels // groups, kernel_size, kernel_size)))
@@ -174,48 +182,126 @@ class ElementWiseRG(nn.Module):
             self.register_parameter('bias', None)
 
         self.scale = config.rkr_scale
-        self.LM_base = nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(self.kernel_size * self.in_channels, config.K)) * self.scale)
-        self.RM_base = nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(config.K, self.kernel_size * self.out_channels)) * self.scale)
+        self.RGnoPB = config.RGnoPB
+        self.LMnoPB = config.LMnoPB
+        self.RMnoPB = config.RMnoPB
+        self.PBwR = config.PBwR
 
-        # Initialize real-valued mask weights.
-        self.mask_real_LM = self.LM_base.data.new(self.LM_base.size())
-        self.mask_real_RM = self.RM_base.data.new(self.RM_base.size())
-        if self.mask_init == '1s':
-            self.mask_real_LM.fill_(self.mask_scale)
-            self.mask_real_RM.fill_(self.mask_scale)
-        elif self.mask_init == 'uniform':
-            self.mask_real_LM.uniform_(-1 * self.mask_scale, self.mask_scale)
-            self.mask_real_RM.uniform_(-1 * self.mask_scale, self.mask_scale)
+        if self.RGnoPB:
+            self.LM_list = nn.ParameterList(
+                [nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(self.kernel_size * self.in_channels, config.K)) * self.scale) for _ in range(config.task_num)])
+            self.RM_list = nn.ParameterList(
+                [nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(config.K, self.kernel_size * self.out_channels)) * self.scale) for _ in range(config.task_num)])
 
-        self.mask_reals_LM = nn.ParameterList()
-        self.mask_reals_RM = nn.ParameterList()
-        for _ in range(config.task_num - 1):
-            self.mask_reals_LM.append(copy.deepcopy(Parameter(self.mask_real_LM)))
-            self.mask_reals_RM.append(copy.deepcopy(Parameter(self.mask_real_RM)))
+        elif self.LMnoPB:
+            self.LM_list = nn.ParameterList(
+                [nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(self.kernel_size * self.in_channels, config.K)) * self.scale) for _ in range(config.task_num)])
 
-        # Initialize the thresholder.
-        if threshold_fn == 'binarizer':
-            # print('Calling binarizer with threshold:', threshold)
-            self.threshold_fn = Binarizer(threshold=threshold)
-        elif threshold_fn == 'ternarizer':
-            # print('Calling ternarizer with threshold:', threshold)
-            self.threshold_fn = Ternarizer(threshold=threshold)
+            self.RM_base = nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(config.K, self.kernel_size * self.out_channels)) * self.scale)
+            self.mask_real_RM = self.RM_base.data.new(self.RM_base.size())
+            if self.mask_init == '1s':
+                self.mask_real_RM.fill_(self.mask_scale)
+            elif self.mask_init == 'uniform':
+                self.mask_real_RM.uniform_(-1 * self.mask_scale, self.mask_scale)
+
+            self.mask_reals_RM = nn.ParameterList()
+            for _ in range(config.task_num - 1):
+                self.mask_reals_RM.append(copy.deepcopy(Parameter(self.mask_real_RM)))
+
+        elif self.RMnoPB:
+            self.RM_list = nn.ParameterList(
+                [nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(config.K, self.kernel_size * self.out_channels)) * self.scale) for _ in range(config.task_num)])
+
+            self.LM_base = nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(self.kernel_size * self.in_channels, config.K)) * self.scale)
+            self.mask_real_LM = self.LM_base.data.new(self.LM_base.size())
+            if self.mask_init == '1s':
+                self.mask_real_LM.fill_(self.mask_scale)
+            elif self.mask_init == 'uniform':
+                self.mask_real_LM.uniform_(-1 * self.mask_scale, self.mask_scale)
+
+            self.mask_reals_LM = nn.ParameterList()
+            for _ in range(config.task_num - 1):
+                self.mask_reals_LM.append(copy.deepcopy(Parameter(self.mask_real_LM)))
+
+        else:
+            self.LM_base = nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(self.kernel_size * self.in_channels, config.K)) * self.scale)
+            self.RM_base = nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(config.K, self.kernel_size * self.out_channels)) * self.scale)
+
+            if self.PBwR:
+                self.mask_real = torch.Tensor(self.kernel_size * self.in_channels, self.kernel_size * self.out_channels)
+                if self.mask_init == '1s':
+                    self.mask_real.fill_(self.mask_scale)
+                elif self.mask_init == 'uniform':
+                    self.mask_real.uniform_(-1 * self.mask_scale, self.mask_scale)
+
+                self.mask_reals = nn.ParameterList()
+                for _ in range(config.task_num - 1):
+                    self.mask_reals.append(copy.deepcopy(Parameter(self.mask_real)))
+
+            else:
+                # Initialize real-valued mask weights.
+                self.mask_real_LM = self.LM_base.data.new(self.LM_base.size())
+                self.mask_real_RM = self.RM_base.data.new(self.RM_base.size())
+                if self.mask_init == '1s':
+                    self.mask_real_LM.fill_(self.mask_scale)
+                    self.mask_real_RM.fill_(self.mask_scale)
+                elif self.mask_init == 'uniform':
+                    self.mask_real_LM.uniform_(-1 * self.mask_scale, self.mask_scale)
+                    self.mask_real_RM.uniform_(-1 * self.mask_scale, self.mask_scale)
+
+                self.mask_reals_LM = nn.ParameterList()
+                self.mask_reals_RM = nn.ParameterList()
+                for _ in range(config.task_num - 1):
+                    self.mask_reals_LM.append(copy.deepcopy(Parameter(self.mask_real_LM)))
+                    self.mask_reals_RM.append(copy.deepcopy(Parameter(self.mask_real_RM)))
 
     def forward(self, x, task):
-        if task == 0:
-            LM = self.LM_base
-            RM = self.RM_base
+        if self.RGnoPB:
+            LM = self.LM_list[task]
+            RM = self.RM_list[task]
+            R = torch.matmul(LM, RM)
+
+        elif self.LMnoPB:
+            if task == 0:
+                R = torch.matmul(self.LM_list[task], self.RM_base)
+            else:
+                mask_thresholded_RM = self.threshold_fn.apply(self.mask_reals_RM[task - 1])
+                LM =  self.LM_list[task]
+                RM =  mask_thresholded_RM * self.RM_base
+                R = torch.matmul(LM, RM)
+
+        elif self.RMnoPB:
+            if task == 0:
+                R = torch.matmul(self.LM_base, self.RM_list[task])
+            else:
+                mask_thresholded_LM = self.threshold_fn.apply(self.mask_reals_LM[task - 1])
+                LM =  mask_thresholded_LM * self.LM_base
+                RM = self.RM_list[task]
+                R = torch.matmul(LM, RM)
+                
         else:
-            # Get binarized/ternarized mask from real-valued mask.
-            mask_thresholded_LM = self.threshold_fn.apply(self.mask_reals_LM[task - 1])
-            mask_thresholded_RM = self.threshold_fn.apply(self.mask_reals_RM[task - 1])
+            if task == 0:
+                R = torch.matmul(self.LM_base, self.RM_base)
+            else:
+                if self.PBwR:
+                    R = torch.matmul(self.LM_base, self.RM_base)
+                    # Get binarized/ternarized mask from real-valued mask.
+                    mask_thresholded = self.threshold_fn.apply(self.mask_reals[task - 1])
+                    # Mask weights with above mask.
+                    R =  mask_thresholded * R
 
-            # Mask weights with above mask.
-            # weight_thresholded = mask_thresholded * self.weight
-            LM =  mask_thresholded_LM * self.LM_base
-            RM =  mask_thresholded_RM * self.RM_base
+                else:
+                    # Get binarized/ternarized mask from real-valued mask.
+                    mask_thresholded_LM = self.threshold_fn.apply(self.mask_reals_LM[task - 1])
+                    mask_thresholded_RM = self.threshold_fn.apply(self.mask_reals_RM[task - 1])
 
-        R = torch.matmul(LM, RM)
+                    # Mask weights with above mask.
+                    # weight_thresholded = mask_thresholded * self.weight
+                    LM =  mask_thresholded_LM * self.LM_base
+                    RM =  mask_thresholded_RM * self.RM_base
+
+                    R = torch.matmul(LM, RM)
+
         R = R.view(self.kernel_size, self.kernel_size, self.in_channels, self.out_channels)
         R = R.permute(3, 2, 0, 1)
 
@@ -241,21 +327,6 @@ class ElementWiseSFG(nn.Module):
             'threshold': threshold,
         }
 
-        self.out_channels = out_channels
-
-        self.F_base = nn.Parameter(torch.ones(self.out_channels))
-
-        # Initialize real-valued mask weights.
-        self.mask_real_F = self.F_base.data.new(self.F_base.size())
-        if self.mask_init == '1s':
-            self.mask_real_F.fill_(self.mask_scale)
-        elif self.mask_init == 'uniform':
-            self.mask_real_F.uniform_(-1 * self.mask_scale, self.mask_scale)
-
-        self.mask_reals_F = nn.ParameterList()
-        for _ in range(config.task_num - 1):
-            self.mask_reals_F.append(copy.deepcopy(Parameter(self.mask_real_F)))
-
         # Initialize the thresholder.
         if threshold_fn == 'binarizer':
             # print('Calling binarizer with threshold:', threshold)
@@ -264,16 +335,40 @@ class ElementWiseSFG(nn.Module):
             # print('Calling ternarizer with threshold:', threshold)
             self.threshold_fn = Ternarizer(threshold=threshold)
 
-    def forward(self, x, task):
-        if task == 0:
-            F = self.F_base
-        else:
-            # Get binarized/ternarized mask from real-valued mask.
-            mask_thresholded_F = self.threshold_fn.apply(self.mask_reals_F[task - 1])
+        self.out_channels = out_channels
 
-            # Mask weights with above mask.
-            # weight_thresholded = mask_thresholded * self.weight
-            F = mask_thresholded_F * self.F_base
+        self.SFGnoPB = config.SFGnoPB
+
+        if self.SFGnoPB:
+            self.F_list = nn.ParameterList([nn.Parameter(torch.ones(self.out_channels)) for _ in range(config.task_num)])
+
+        else:
+            self.F_base = nn.Parameter(torch.ones(self.out_channels))
+
+            # Initialize real-valued mask weights.
+            self.mask_real_F = self.F_base.data.new(self.F_base.size())
+            if self.mask_init == '1s':
+                self.mask_real_F.fill_(self.mask_scale)
+            elif self.mask_init == 'uniform':
+                self.mask_real_F.uniform_(-1 * self.mask_scale, self.mask_scale)
+
+            self.mask_reals_F = nn.ParameterList()
+            for _ in range(config.task_num - 1):
+                self.mask_reals_F.append(copy.deepcopy(Parameter(self.mask_real_F)))
+
+    def forward(self, x, task):
+        if self.SFGnoPB:
+            F = self.F_list[task]
+        else:
+            if task == 0:
+                F = self.F_base
+            else:
+                # Get binarized/ternarized mask from real-valued mask.
+                mask_thresholded_F = self.threshold_fn.apply(self.mask_reals_F[task - 1])
+
+                # Mask weights with above mask.
+                # weight_thresholded = mask_thresholded * self.weight
+                F = mask_thresholded_F * self.F_base
 
         F = F.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
         F = F.repeat(x.shape[0], 1, x.shape[2], x.shape[3])

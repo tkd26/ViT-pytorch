@@ -76,6 +76,11 @@ def get_resnet18_RKRPB_config():
     config.threshold_fn = 'binarizer'
     config.mask_scale = 1e-2
     config.mask_init = '1s'
+    config.RGnoPB = False
+    config.SFGnoPB = False
+    config.LMnoPB = False
+    config.RMnoPB = False
+    config.PBwR = False
     return config
 
 def get_resnet18_PBG_config():
@@ -171,6 +176,11 @@ class ViTConfig(object):
         output_config.threshold_fn = 'binarizer'
         output_config.mask_scale = 1e-2
         output_config.mask_init = '1s'
+        output_config.RGnoPB = False
+        output_config.LMnoPB = False
+        output_config.RMnoPB = False
+        output_config.SFGnoPB = False
+        output_config.PBwR = False
         return output_config
 
     def get_b16_PBG_config(self):
@@ -215,6 +225,8 @@ class SwinConfig(object):
             config.drop_path_rate = 0.2
         elif dataset == 'imagenet':
             config.drop_path_rate = 0.5
+        elif dataset == 'VD':
+            config.drop_path_rate = 0.2
         config.label_smoothing = 0.1
 
         config.patch_size = 4
@@ -228,8 +240,19 @@ class SwinConfig(object):
         elif dataset == 'imagenet':
             # Base
             config.embed_dim = 128
-            config.depths = [ 2, 2, 18, 2 ]
-            config.num_heads = [ 4, 8, 16, 32 ]
+            config.depths = [ 2, 2, 18] # [ 2, 2, 18, 2 ]
+            config.num_heads = [ 4, 8, 16, 32 ] # [ 4, 8, 16, 32 ]
+        elif dataset == 'VD':
+            # Tiny
+            # config.embed_dim = 96
+            # # config.depths = [ 2, 2 ] # [ 2, 2, 6, 2 ]
+            # # config.num_heads = [ 3, 6 ] # [ 3, 6, 12, 24 ]
+            # config.depths = [ 2, 2, 6, 2 ]
+            # config.num_heads = [ 3, 6, 12, 24 ]
+            # Base
+            config.embed_dim = 128
+            config.depths = [ 2, 2, 18] # [ 2, 2, 18, 2 ]
+            config.num_heads = [ 4, 8, 16, 32 ] # [ 4, 8, 16, 32 ]
         config.window_size = 7
         config.mlp_ratio = 4.
         config.qkv_bias = True
@@ -284,6 +307,11 @@ class SwinConfig(object):
         output_config.threshold_fn = 'binarizer'
         output_config.mask_scale = 1e-2
         output_config.mask_init = '1s'
+        output_config.RGnoPB = False
+        output_config.LMnoPB = False
+        output_config.RMnoPB = False
+        output_config.SFGnoPB = False
+        output_config.PBwR = False
         return output_config
 
     def get_swin_PBG_config(self, dataset=None):

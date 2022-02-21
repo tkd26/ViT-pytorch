@@ -154,6 +154,12 @@ class ElementWiseRG(nn.Module):
             'threshold': threshold,
         }
 
+        # Initialize the thresholder.
+        if config.threshold_fn == 'binarizer':
+            self.threshold_fn = Binarizer(threshold=threshold)
+        elif config.threshold_fn == 'ternarizer':
+            self.threshold_fn = Ternarizer(threshold=threshold)
+
         # weight and bias are no longer Parameters.
         self.weight = nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(
             out_features, in_features)))
@@ -165,49 +171,132 @@ class ElementWiseRG(nn.Module):
 
         self.scale = config.rkr_scale
         K = config.K
-        self.LM_base = nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(in_features, K)) * self.scale)
-        self.RM_base = nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(K, out_features)) * self.scale)
+        self.RGnoPB = config.RGnoPB
+        self.RMnoPB = config.RMnoPB
+        self.LMnoPB = config.LMnoPB
+        self.PBwR = config.PBwR
 
-        # Initialize real-valued mask weights.
-        self.mask_real_LM = self.LM_base.data.new(self.LM_base.size())
-        self.mask_real_RM = self.RM_base.data.new(self.RM_base.size())
-        if self.mask_init == '1s':
-            self.mask_real_LM.fill_(self.mask_scale)
-            self.mask_real_RM.fill_(self.mask_scale)
-        elif self.mask_init == 'uniform':
-            self.mask_real_LM.uniform_(-1 * self.mask_scale, self.mask_scale)
-            self.mask_real_RM.uniform_(-1 * self.mask_scale, self.mask_scale)
+        # print(in_features, out_features) # 768~3072
 
-        self.mask_reals_LM = nn.ParameterList()
-        self.mask_reals_RM = nn.ParameterList()
-        for _ in range(config.task_num - 1):
-            self.mask_reals_LM.append(copy.deepcopy(Parameter(self.mask_real_LM)))
-            self.mask_reals_RM.append(copy.deepcopy(Parameter(self.mask_real_RM)))
+        if self.RGnoPB:
+            self.LM_list = nn.ParameterList(
+                [nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(in_features, K)) * self.scale) for _ in range(config.task_num)])
+            self.RM_list = nn.ParameterList(
+                [nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(K, out_features)) * self.scale) for _ in range(config.task_num)])
 
-        # Initialize the thresholder.
-        if config.threshold_fn == 'binarizer':
-            self.threshold_fn = Binarizer(threshold=threshold)
-        elif config.threshold_fn == 'ternarizer':
-            self.threshold_fn = Ternarizer(threshold=threshold)
+        elif self.LMnoPB:
+            self.LM_list = nn.ParameterList(
+                [nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(in_features, K)) * self.scale) for _ in range(config.task_num)])
+
+            self.RM_base = nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(K, out_features)) * self.scale)
+            self.mask_real_RM = self.RM_base.data.new(self.RM_base.size())
+            
+            if self.mask_init == '1s':
+                self.mask_real_RM.fill_(self.mask_scale)
+            elif self.mask_init == 'uniform':
+                self.mask_real_RM.uniform_(-1 * self.mask_scale, self.mask_scale)
+
+            self.mask_reals_RM = nn.ParameterList()
+            for _ in range(config.task_num - 1):
+                self.mask_reals_RM.append(copy.deepcopy(Parameter(self.mask_real_RM)))
+        
+        elif self.RMnoPB:
+            self.RM_list = nn.ParameterList(
+                [nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(K, out_features)) * self.scale) for _ in range(config.task_num)])
+
+            self.LM_base = nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(in_features, K)) * self.scale)
+            self.mask_real_LM = self.LM_base.data.new(self.LM_base.size())
+            if self.mask_init == '1s':
+                self.mask_real_LM.fill_(self.mask_scale)
+            elif self.mask_init == 'uniform':
+                self.mask_real_LM.uniform_(-1 * self.mask_scale, self.mask_scale)
+
+            self.mask_reals_LM = nn.ParameterList()
+            for _ in range(config.task_num - 1):
+                self.mask_reals_LM.append(copy.deepcopy(Parameter(self.mask_real_LM)))
+
+        else:
+
+            self.LM_base = nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(in_features, K)) * self.scale)
+            self.RM_base = nn.Parameter(nn.init.kaiming_uniform_(torch.Tensor(K, out_features)) * self.scale)
+
+            if self.PBwR: # フィルタに対して直接PBを適用
+                self.mask_real = torch.Tensor(in_features, out_features)
+                if self.mask_init == '1s':
+                    self.mask_real.fill_(self.mask_scale)
+                elif self.mask_init == 'uniform':
+                    self.mask_real.uniform_(-1 * self.mask_scale, self.mask_scale)
+
+                self.mask_reals = nn.ParameterList()
+                for _ in range(config.task_num - 1):
+                    self.mask_reals.append(copy.deepcopy(Parameter(self.mask_real)))
+
+            else:
+                # Initialize real-valued mask weights.
+                self.mask_real_LM = self.LM_base.data.new(self.LM_base.size())
+                self.mask_real_RM = self.RM_base.data.new(self.RM_base.size())
+                if self.mask_init == '1s':
+                    self.mask_real_LM.fill_(self.mask_scale)
+                    self.mask_real_RM.fill_(self.mask_scale)
+                elif self.mask_init == 'uniform':
+                    self.mask_real_LM.uniform_(-1 * self.mask_scale, self.mask_scale)
+                    self.mask_real_RM.uniform_(-1 * self.mask_scale, self.mask_scale)
+
+                self.mask_reals_LM = nn.ParameterList()
+                self.mask_reals_RM = nn.ParameterList()
+                for _ in range(config.task_num - 1):
+                    self.mask_reals_LM.append(copy.deepcopy(Parameter(self.mask_real_LM)))
+                    self.mask_reals_RM.append(copy.deepcopy(Parameter(self.mask_real_RM)))
 
     def forward(self, input, task):
 
-        if task == 0:
-            R = torch.matmul(self.LM_base, self.RM_base)
-            R = R.permute(1, 0)
+        if self.RGnoPB:
+            R = torch.matmul(self.LM_list[task], self.RM_list[task])
+
+        elif self.LMnoPB:
+            if task == 0:
+                R = torch.matmul(self.LM_list[task], self.RM_base)
+            else:
+                mask_thresholded_RM = self.threshold_fn.apply(self.mask_reals_RM[task - 1])
+
+                LM = self.LM_list[task]
+                RM = mask_thresholded_RM * self.RM_base
+                R = torch.matmul(LM, RM)
+
+        elif self.RMnoPB:
+            if task == 0:
+                R = torch.matmul(self.LM_base, self.RM_list[task])
+            else:
+                mask_thresholded_LM = self.threshold_fn.apply(self.mask_reals_LM[task - 1])
+
+                LM = mask_thresholded_LM * self.LM_base
+                RM = self.RM_list[task]
+                R = torch.matmul(LM, RM)
+
         else:
-            # Get binarized/ternarized mask from real-valued mask.
-            mask_thresholded_LM = self.threshold_fn.apply(self.mask_reals_LM[task - 1])
-            mask_thresholded_RM = self.threshold_fn.apply(self.mask_reals_RM[task - 1])
+            if task == 0:
+                R = torch.matmul(self.LM_base, self.RM_base)
+            else:
+                if self.PBwR:
+                    R = torch.matmul(self.LM_base, self.RM_base)
+                    
+                    # Get binarized/ternarized mask from real-valued mask.
+                    mask_thresholded = self.threshold_fn.apply(self.mask_reals[task - 1])
+                    # Mask weights with above mask.
+                    R =  mask_thresholded * R
 
-            # Mask weights with above mask.
-            # weight_thresholded = mask_thresholded * self.weight
-            LM =  mask_thresholded_LM * self.LM_base
-            RM =  mask_thresholded_RM * self.RM_base
+                else:
+                    # Get binarized/ternarized mask from real-valued mask.
+                    mask_thresholded_LM = self.threshold_fn.apply(self.mask_reals_LM[task - 1])
+                    mask_thresholded_RM = self.threshold_fn.apply(self.mask_reals_RM[task - 1])
 
-            R = torch.matmul(LM, RM)
-            R = R.permute(1, 0)
-
+                    # Mask weights with above mask.
+                    # weight_thresholded = mask_thresholded * self.weight
+                    LM =  mask_thresholded_LM * self.LM_base
+                    RM =  mask_thresholded_RM * self.RM_base
+                    R = torch.matmul(LM, RM)
+                
+        R = R.permute(1, 0)
         weight = R + self.weight
 
         return F.linear(input, weight, self.bias)
@@ -232,36 +321,45 @@ class ElementWiseSFG(nn.Module):
             'threshold': threshold,
         }
 
-        self.F_base = nn.Parameter(torch.ones(out_features))
-
-        # Initialize real-valued mask weights.
-        self.mask_real_F = self.F_base.data.new(self.F_base.size())
-        if self.mask_init == '1s':
-            self.mask_real_F.fill_(self.mask_scale)
-        elif self.mask_init == 'uniform':
-            self.mask_real_F.uniform_(-1 * self.mask_scale, self.mask_scale)
-
-        self.mask_reals_F = nn.ParameterList()
-        for _ in range(config.task_num - 1):
-            self.mask_reals_F.append(copy.deepcopy(Parameter(self.mask_real_F)))
-
         # Initialize the thresholder.
         if config.threshold_fn == 'binarizer':
             self.threshold_fn = Binarizer(threshold=threshold)
         elif config.threshold_fn == 'ternarizer':
             self.threshold_fn = Ternarizer(threshold=threshold)
 
+        self.SFGnoPB = config.SFGnoPB
+
+        if self.SFGnoPB:
+            self.F_base = nn.Parameter(torch.ones(out_features))
+            self.F_list = nn.ParameterList([nn.Parameter(torch.ones(out_features)) for _ in range(config.task_num)])
+        else:
+            self.F_base = nn.Parameter(torch.ones(out_features))
+
+            # Initialize real-valued mask weights.
+            self.mask_real_F = self.F_base.data.new(self.F_base.size())
+            if self.mask_init == '1s':
+                self.mask_real_F.fill_(self.mask_scale)
+            elif self.mask_init == 'uniform':
+                self.mask_real_F.uniform_(-1 * self.mask_scale, self.mask_scale)
+
+            self.mask_reals_F = nn.ParameterList()
+            for _ in range(config.task_num - 1):
+                self.mask_reals_F.append(copy.deepcopy(Parameter(self.mask_real_F)))
+
     def forward(self, x, task):
 
-        if task == 0:
-            F = self.F_base
+        if self.SFGnoPB:
+            F = self.F_list[task]
         else:
-            # Get binarized/ternarized mask from real-valued mask.
-            mask_thresholded_F = self.threshold_fn.apply(self.mask_reals_F[task - 1])
+            if task == 0:
+                F = self.F_base
+            else:
+                # Get binarized/ternarized mask from real-valued mask.
+                mask_thresholded_F = self.threshold_fn.apply(self.mask_reals_F[task - 1])
 
-            # Mask weights with above mask.
-            # weight_thresholded = mask_thresholded * self.weight
-            F = mask_thresholded_F * self.F_base
+                # Mask weights with above mask.
+                # weight_thresholded = mask_thresholded * self.weight
+                F = mask_thresholded_F * self.F_base
 
         F = F.unsqueeze(0).unsqueeze(0)
         F = F.repeat(x.shape[0], x.shape[1], 1)
